@@ -194,7 +194,7 @@ export function GlobalNavbar({
       <div className="h-2 bg-slate-100 hidden sm:block" />
       
       {/* Main navigation bar */}
-      <nav id="global-navbar-inner" className="sticky top-0 z-50 border-b border-slate-200 bg-white">
+      <nav id="global-navbar-inner" className="sticky top-[env(safe-area-inset-top)] z-50 border-b border-slate-200 bg-white">
         {/* Desktop Layout */}
         <div className="hidden md:flex mx-auto max-w-7xl items-center px-4 py-2 gap-3">
           {/* Logo */}

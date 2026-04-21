@@ -83,6 +83,13 @@ export default async function RootLayout({
         >
           Saltar al contenido principal
         </a>
+        
+        {/* Physical Status Bar Shield to prevent transparent bleeding under iOS Notch */}
+        <div 
+          className="fixed top-0 left-0 right-0 w-full bg-white z-[9999]" 
+          style={{ height: 'env(safe-area-inset-top)' }} 
+        />
+        
         <OperatorProvider operator={operator}>
           <CartProvider>
             {children}
