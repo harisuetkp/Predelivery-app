@@ -15,12 +15,6 @@ body {
   background-color: var(--background);
 }
 
-@media (max-width: 768px) {
-  body {
-    padding-bottom: calc(env(safe-area-inset-bottom) + 64px);
-  }
-}
-
 @custom-variant dark (&:is(.dark *));
 
 :root {

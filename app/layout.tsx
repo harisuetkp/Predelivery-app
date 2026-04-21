@@ -86,7 +86,7 @@ export default async function RootLayout({
         <OperatorProvider operator={operator}>
           <CartProvider>
             {children}
-            <MobileBottomNav />
+            {/* <MobileBottomNav /> */}
             <Toaster />
             <SplashScreenHandler />
           </CartProvider>
