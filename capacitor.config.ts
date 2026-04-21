@@ -7,10 +7,9 @@ const config: CapacitorConfig = {
   appName: "SaleCalle Marketplace",
   webDir: "out",
   server: {
-    // During development, point to your local Next.js dev server.
     // For production mobile builds, load the live website.
-    url: "http://localhost:3000",
-    cleartext: true,
+    url: "https://www.prdelivery.com",
+    // cleartext: true, // (Removed: Only needed for localhost testing)
     // Prevents Capacitor from throwing URLs out to the system browser (Safari)
     allowNavigation: ["prdelivery.com", "*.prdelivery.com", "*.supabase.co", "checkout.stripe.com"],
   },
