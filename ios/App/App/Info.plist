@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+        <string>SaleCalle Marketplace</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>UILaunchStoryboardName</key>
+	<string>LaunchScreen</string>
+	<key>UIMainStoryboardFile</key>
+	<string>Main</string>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>armv7</string>
+	</array>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UIViewControllerBasedStatusBarAppearance</key>
+	<true/>
+
+	<!-- ─── Google Sign In — iOS Client ID ────────────────────────────────────
+	     GIDClientID must match the CLIENT_ID value in GoogleService-Info.plist.
+	     Replace with your actual iOS Client ID from Firebase Console.         -->
+	<key>GIDClientID</key>
+	<string>293965454826-45j6rm2ef9gdcae7lf5ggu01v94kb4sd.apps.googleusercontent.com</string>
+
+	<!-- ─── URL Schemes for OAuth deep-link callbacks ──────────────────────── -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<!-- salecalle:// — used by Supabase to redirect back after OAuth flow -->
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>ca.salecalle.marketplace.app</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>salecalle</string>
+			</array>
+		</dict>
+		<!-- Google Reversed Client ID — required by GoogleSignIn SDK on iOS.
+		     Replace REPLACE_WITH_REVERSED_CLIENT_ID with the value from
+		     GoogleService-Info.plist REVERSED_CLIENT_ID field.               -->
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>google-signin</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>com.googleusercontent.apps.293965454826-45j6rm2ef9gdcae7lf5ggu01v94kb4sd</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

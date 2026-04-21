@@ -1,0 +1,50 @@
+{
+  "_README": "REPLACE THIS FILE with the real google-services.json downloaded from your Firebase Console.",
+  "_INSTRUCTIONS": [
+    "1. Go to https://console.firebase.google.com",
+    "2. Select or create your project",
+    "3. Add an Android app with package name: ca.salecalle.marketplace.app",
+    "4. Download google-services.json and replace this file",
+    "5. The Gradle build will automatically pick it up and apply the Google Services plugin"
+  ],
+  "project_info": {
+    "project_number": "REPLACE",
+    "project_id": "REPLACE",
+    "storage_bucket": "REPLACE.appspot.com"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "REPLACE",
+        "android_client_info": {
+          "package_name": "ca.salecalle.marketplace.app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "REPLACE_WITH_ANDROID_CLIENT_ID.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "ca.salecalle.marketplace.app",
+            "certificate_hash": "REPLACE_WITH_SHA1_FINGERPRINT"
+          }
+        },
+        {
+          "client_id": "REPLACE_WITH_WEB_CLIENT_ID.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "REPLACE_WITH_API_KEY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

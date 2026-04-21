@@ -1,0 +1,8 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">SaleCalle Marketplace</string>
+    <string name="title_activity_main">SaleCalle Marketplace</string>
+    <string name="package_name">ca.salecalle.marketplace.app</string>
+    <string name="custom_url_scheme">ca.salecalle.marketplace.app</string>
+    <string name="server_client_id">293965454826-9msbtr2th9bt7b13io9vhumkfn5v5hqe.apps.googleusercontent.com</string>
+</resources>

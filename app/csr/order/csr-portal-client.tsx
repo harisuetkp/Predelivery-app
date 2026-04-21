@@ -1,0 +1,3192 @@
+"use client"
+
+import { useState, useEffect } from "react"
+import dynamic from "next/dynamic"
+import { createClient } from "@/lib/supabase/client"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
+import { Checkbox } from "@/components/ui/checkbox"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { Phone, Search, Building2, X, ShoppingCart, Minus, Plus, Trash2, ChevronRight, ChevronLeft, LogOut, Menu, User, MapPin, Clock, CalendarIcon, Store, Package, ArrowLeft } from "lucide-react"
+import Link from "next/link"
+import { useRouter } from "next/navigation"
+import { calculateDeliveryFee } from "@/app/actions/delivery-zones"
+import { AddressAutocomplete, type AddressComponents } from "@/components/address-autocomplete"
+import { DeliveryPinConfirm } from "@/components/delivery-pin-confirm"
+import { LocateMeButton } from "@/components/locate-me-button"
+import { calculateDispatchFee, type DispatchFeeType, type DispatchFeeAppliesTo } from "@/lib/catering/dispatch-fee"
+
+// Dynamic import for payment components
+const StripeCheckout = dynamic(() => import("@/components/stripe-checkout"), { ssr: false })
+const ATHMovilCheckout = dynamic(() => import("@/components/athmovil-checkout"), { ssr: false })
+
+interface Restaurant {
+  id: string
+  name: string
+  slug: string
+  logo_url: string | null
+  cuisine_type: string | null
+  cuisine_types: string[] | null
+  area: string | null
+  tax_rate: number | null
+  delivery_fee: number | null
+  delivery_base_fee: number | null
+  dispatch_fee_percent: number | null
+  address: string | null
+  city: string | null
+  state: string | null
+  athmovil_public_token: string | null
+  athmovil_ecommerce_id: string | null
+  athmovil_enabled: boolean | null
+  stripe_account_id: string | null
+  payment_type?: "ach" | "pop" | "ath" | "pbp" | "poo" | null
+  block_override?: boolean | null
+}
+
+interface CateringRestaurant {
+  id: string
+  name: string
+  slug: string
+  logo_url: string | null
+  description: string | null
+  cuisine_type: string | null
+  tax_rate: number | null
+  default_lead_time_hours: number
+  max_advance_days: number
+  operator_id: string | null
+  // Dispatch fee configuration
+  dispatch_fee_type: DispatchFeeType | null
+  dispatch_fee_value: number | null
+  dispatch_fee_applies_to: DispatchFeeAppliesTo | null
+}
+
+interface ItemOption {
+  id: string
+  category: string
+  prompt: string | null
+  is_required: boolean
+  min_selection: number | null
+  max_selection: number | null
+  display_type: string | null
+  item_option_choices: {
+    id: string
+    name: string
+    price_modifier: number | null
+    description: string | null
+  }[]
+}
+
+interface CartItem {
+  id: string
+  itemId: string
+  name: string
+  price: number
+  quantity: number
+  description?: string
+  selectedOptions?: Record<string, string>
+  customizations?: Record<string, string | string[]>
+  notes?: string
+  isInternalShop?: boolean
+}
+
+interface CSRPortalClientProps {
+  restaurants: Restaurant[]
+  cateringRestaurants: CateringRestaurant[]
+  isPOPBlocked?: boolean
+}
+
+// Calculate default time: today's date and current time + offset
+function getDefaultDateTime(deliveryType: "delivery" | "pickup") {
+  const now = new Date()
+  const offsetMinutes = deliveryType === "delivery" ? 45 : 20
+  now.setMinutes(now.getMinutes() + offsetMinutes)
+  
+  // Round to nearest 5 minutes
+  const minutes = Math.ceil(now.getMinutes() / 5) * 5
+  now.setMinutes(minutes)
+  
+  const date = now.toISOString().split("T")[0]
+  const time = now.toTimeString().slice(0, 5)
+  
+  return { date, time }
+}
+
+export function CSRPortalClient({ restaurants, cateringRestaurants, isPOPBlocked = false }: CSRPortalClientProps) {
+  const supabase = createClient()
+  const router = useRouter()
+  
+  // Tent selector state - defaults to Online Ordering
+  const [activeTent, setActiveTent] = useState<"online_ordering" | "catering">("online_ordering")
+  
+  const [searchTerm, setSearchTerm] = useState("")
+  const [selectedRestaurant, setSelectedRestaurant] = useState<Restaurant | null>(null)
+  const [selectedCateringRestaurant, setSelectedCateringRestaurant] = useState<CateringRestaurant | null>(null)
+  const [menuItems, setMenuItems] = useState<any[]>([])
+  const [branches, setBranches] = useState<any[]>([])
+  const [cateringBranches, setCateringBranches] = useState<any[]>([])
+  const [cateringCategories, setCateringCategories] = useState<any[]>([])
+  const [internalShopItems, setInternalShopItems] = useState<any[]>([])
+  const [showInternalShop, setShowInternalShop] = useState(false)
+  const [loading, setLoading] = useState(false)
+  
+  // Left slideout - Restaurant selector (visible by default)
+  const [isRestaurantPanelOpen, setIsRestaurantPanelOpen] = useState(true)
+  
+  // Right slideout - Cart
+  const [isCartOpen, setIsCartOpen] = useState(false)
+  
+  // Cart state
+  const [cart, setCart] = useState<CartItem[]>([])
+  const [menuSearchTerm, setMenuSearchTerm] = useState("")
+  // Menu category tab — "TODO" shows all (legacy multi-column), or a specific category name
+  const [selectedMenuCategory, setSelectedMenuCategory] = useState<string>("TODO")
+  // Column count for single-category view (1/2/3). Default 3 for wide screens.
+  const [menuColumnCount, setMenuColumnCount] = useState<1 | 2 | 3>(3)
+  // Per-category collapse state for the Todo view. Restaurants with
+  // many low-volume sub-categories (wine, etc.) can be trimmed down.
+  const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set())
+  
+  // Item detail modal state
+  const [selectedItem, setSelectedItem] = useState<any | null>(null)
+  const [itemOptions, setItemOptions] = useState<ItemOption[]>([])
+  const [itemCustomizations, setItemCustomizations] = useState<Record<string, string | string[]>>({})
+  const [loadingOptions, setLoadingOptions] = useState(false)
+  const [itemNotes, setItemNotes] = useState("")
+  const [showItemNotes, setShowItemNotes] = useState(false)
+  
+  // Tip state
+  const [tipPercentage, setTipPercentage] = useState<number>(15)
+  const [customTip, setCustomTip] = useState<string>("")
+  
+  // IVU rate from selected restaurant
+  const IVU_RATE = selectedRestaurant?.tax_rate ?? 0.115 // Default 11.5% IVU for Puerto Rico
+  
+  // Order processing state
+  
+  const [orderSuccess, setOrderSuccess] = useState<string | null>(null)
+  
+  // Payment method state
+  const [paymentMethod, setPaymentMethod] = useState<"stripe" | "ath_movil" | "cash" | "saved_card">("stripe")
+  const [showPaymentModal, setShowPaymentModal] = useState(false)
+  
+  // Delivery fee state (calculated from delivery zones)
+  const [calculatedDeliveryFee, setCalculatedDeliveryFee] = useState<number>(0)
+  const [deliveryDistance, setDeliveryDistance] = useState<number>(0)
+  const [deliverySubsidy, setDeliverySubsidy] = useState<number>(0)
+  const [isCalculatingFee, setIsCalculatingFee] = useState(false)
+  
+  // Get default date/time based on delivery type
+  const defaultDateTime = getDefaultDateTime("delivery")
+  
+  // Customer info state
+  const [customerInfo, setCustomerInfo] = useState({
+    phone: "",
+    name: "",
+    email: "",
+    streetAddress: "",
+    streetAddress2: "", // Apt, Urb, Suite, etc.
+    city: "",
+    state: "PR", // Default to Puerto Rico
+    zip: "",
+    deliveryType: "delivery" as "delivery" | "pickup",
+    eventDate: defaultDateTime.date,
+    eventTime: defaultDateTime.time,
+    specialInstructions: "",
+    selectedBranch: "",
+    // Catering-specific fields
+    guestCount: "",
+    // Geocoding — coords resolved from autocomplete / pin / Ubicarme so the
+    // CSR can confirm rooftop accuracy before sending to Shipday. Mirrors
+    // the deliveryInfo shape on the customer-facing checkout.
+    latitude: null as number | null,
+    longitude: null as number | null,
+  })
+  // Pin-confirmation gate (low-confidence picks force CSR to drag-confirm).
+  const [addressConfidence, setAddressConfidence] = useState<"high" | "low">("high")
+  const [pinConfirmed, setPinConfirmed] = useState(false)
+  
+  // Reset all form state when tent changes
+  useEffect(() => {
+    setSearchTerm("")
+    setSelectedRestaurant(null)
+    setSelectedCateringRestaurant(null)
+    setMenuItems([])
+    setBranches([])
+    setCateringBranches([])
+    setCateringCategories([])
+    setCart([])
+    setIsCartOpen(false)
+    setSelectedItem(null)
+    setIsRestaurantPanelOpen(true)
+    setCustomerInfo({
+      phone: "",
+      name: "",
+      email: "",
+      streetAddress: "",
+      streetAddress2: "",
+      city: "",
+      state: "PR",
+      zip: "",
+      deliveryType: "delivery",
+      eventDate: getDefaultDateTime("delivery").date,
+      eventTime: getDefaultDateTime("delivery").time,
+      specialInstructions: "",
+      selectedBranch: "",
+      guestCount: "",
+      latitude: null,
+      longitude: null,
+    })
+    setAddressConfidence("high")
+    setPinConfirmed(false)
+    setSelectedCustomerId(null)
+    setCustomerPaymentMethods([])
+    setCalculatedDeliveryFee(0)
+  }, [activeTent])
+  
+  // Customer autocomplete state
+  const [customerSearchResults, setCustomerSearchResults] = useState<any[]>([])
+  const [showCustomerDropdown, setShowCustomerDropdown] = useState(false)
+  const [customerSearchQuery, setCustomerSearchQuery] = useState("")
+  const [selectedCustomerId, setSelectedCustomerId] = useState<string | null>(null)
+  const [isSearchingCustomers, setIsSearchingCustomers] = useState(false)
+  const [customerPaymentMethods, setCustomerPaymentMethods] = useState<any[]>([])
+  const [selectedPaymentMethodId, setSelectedPaymentMethodId] = useState<string | null>(null)
+  const [customerAddresses, setCustomerAddresses] = useState<any[]>([])
+  const [isNewCustomer, setIsNewCustomer] = useState(false)
+  
+  // Read-back confirmation state
+  const [showReadbackModal, setShowReadbackModal] = useState(false)
+
+  useEffect(() => {
+    if (customerSearchQuery.length < 2) {
+      setCustomerSearchResults([])
+      return
+    }
+    const timer = setTimeout(() => {
+      searchCustomers(customerSearchQuery)
+    }, 300)
+    return () => clearTimeout(timer)
+  }, [customerSearchQuery])
+  
+  // Pin-adjust dialog visibility. The inline pin-confirm panel lived
+  // inside the form and got crushed to ~250px wide on CSR (right
+  // column), which defeated the point of the map + Street View. We
+  // moved it into a Dialog so the dispatcher gets real canvas.
+  const [pinDialogOpen, setPinDialogOpen] = useState(false)
+  
+  // Available restaurants filtered by delivery zone
+  const [zoneFilteredRestaurants, setZoneFilteredRestaurants] = useState<Restaurant[]>(restaurants)
+  
+  // Update time when delivery type changes
+  useEffect(() => {
+    const { date, time } = getDefaultDateTime(customerInfo.deliveryType)
+    setCustomerInfo(prev => ({ ...prev, eventDate: date, eventTime: time }))
+  }, [customerInfo.deliveryType])
+
+  // Filter restaurants by search AND delivery zone
+  const filteredRestaurants = zoneFilteredRestaurants.filter((r) =>
+    r.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+    r.cuisine_type?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+    r.area?.toLowerCase().includes(searchTerm.toLowerCase())
+  )
+
+  // Load menu items and branches when restaurant is selected
+  const selectRestaurant = async (restaurant: Restaurant) => {
+    // If switching restaurants, clear the cart (can't mix items from different restaurants)
+    if (selectedRestaurant && selectedRestaurant.id !== restaurant.id && cart.length > 0) {
+      const confirmSwitch = window.confirm(
+        `Cambiar a ${restaurant.name} vaciará el carrito actual. ¿Desea continuar?`
+      )
+      if (!confirmSwitch) return
+      setCart([])
+    }
+    
+    setLoading(true)
+    setSelectedRestaurant(restaurant)
+    // Keep restaurant panel visible by default - user can hide manually
+
+    try {
+      const { data: items } = await supabase
+        .from("menu_items")
+        .select("*, categories(name)")
+        .eq("restaurant_id", restaurant.id)
+        .eq("is_active", true)
+        .order("display_order", { ascending: true })
+
+      const { data: branchData } = await supabase
+        .from("branches")
+        .select("*")
+        .eq("restaurant_id", restaurant.id)
+        .eq("is_active", true)
+        .order("display_order", { ascending: true })
+
+setMenuItems(items || [])
+    setBranches(branchData || [])
+    
+    // Fetch internal shop items
+    const { data: shopItems } = await supabase
+      .from("internal_shop_items")
+      .select("*")
+      .eq("is_active", true)
+      .order("category", { ascending: true })
+      .order("name", { ascending: true })
+    
+    setInternalShopItems(shopItems || [])
+      
+      // Auto-select first branch
+      if (branchData && branchData.length > 0) {
+        setCustomerInfo(prev => ({ ...prev, selectedBranch: branchData[0].id }))
+      }
+    } catch (error) {
+      console.error("Error loading restaurant data:", error)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // Load catering menu items and branches when catering restaurant is selected
+  const selectCateringRestaurant = async (restaurant: CateringRestaurant) => {
+    // If switching restaurants, clear the cart
+    if (selectedCateringRestaurant && selectedCateringRestaurant.id !== restaurant.id && cart.length > 0) {
+      const confirmSwitch = window.confirm(
+        `Cambiar a ${restaurant.name} vaciará el carrito actual. ¿Desea continuar?`
+      )
+      if (!confirmSwitch) return
+      setCart([])
+    }
+    
+    setLoading(true)
+    setSelectedCateringRestaurant(restaurant)
+
+    try {
+      // Fetch catering data from API
+      const response = await fetch(`/api/csr/catering-data?restaurantId=${restaurant.id}`)
+      if (!response.ok) {
+        const errorData = await response.json()
+        throw new Error(errorData.error || `Failed to fetch catering data: ${response.status}`)
+      }
+      
+      const data = await response.json()
+      
+      setCateringBranches(data.branches || [])
+      setCateringCategories(data.categories || [])
+      setMenuItems(data.menuItems || [])
+      
+      // Auto-select first branch if available
+      if (data.branches && data.branches.length > 0) {
+        setCustomerInfo(prev => ({ ...prev, selectedBranch: data.branches[0].id }))
+      }
+    } catch (error) {
+      console.error("Error loading catering restaurant data:", error)
+      alert(`Error cargando datos del restaurante: ${error instanceof Error ? error.message : "Error desconocido"}`)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const clearSelection = () => {
+    setSelectedRestaurant(null)
+    setSelectedCateringRestaurant(null)
+    setMenuItems([])
+    setBranches([])
+    setCateringBranches([])
+    setCateringCategories([])
+    setCart([])
+    setIsCartOpen(false)
+    setSelectedItem(null)
+    setIsRestaurantPanelOpen(true)
+  }
+
+  const handleLogout = async () => {
+    await supabase.auth.signOut()
+    window.location.href = "/auth/login"
+  }
+
+  // Load item options when item is selected - FIXED: use menu_item_id
+  const openItemDetail = async (item: any) => {
+    setSelectedItem(item)
+    setItemCustomizations({})
+    setLoadingOptions(true)
+
+    try {
+      const { data: options, error } = await supabase
+        .from("item_options")
+        .select(`
+          id,
+          category,
+          prompt,
+          is_required,
+          min_selection,
+          max_selection,
+          display_type,
+          item_option_choices (
+            id,
+            name,
+            price_modifier,
+            description
+          )
+        `)
+        .eq("menu_item_id", item.id)
+        .order("display_order", { ascending: true })
+
+      if (error) {
+        console.error("[v0] Error fetching options:", error)
+      }
+      
+      setItemOptions(options || [])
+    } catch (error) {
+      console.error("Error loading item options:", error)
+      setItemOptions([])
+    } finally {
+      setLoadingOptions(false)
+    }
+  }
+
+  // Handle option selection
+  const handleOptionSelect = (optionId: string, choiceId: string, isMulti: boolean) => {
+    setItemCustomizations((prev) => {
+      if (isMulti) {
+        const current = (prev[optionId] as string[]) || []
+        if (current.includes(choiceId)) {
+          return { ...prev, [optionId]: current.filter((id) => id !== choiceId) }
+        }
+        return { ...prev, [optionId]: [...current, choiceId] }
+      }
+      return { ...prev, [optionId]: choiceId }
+    })
+  }
+
+  // Calculate item price with options
+  const calculateItemPrice = (item: any) => {
+    let price = Number(item.price) || 0
+    
+    Object.entries(itemCustomizations).forEach(([optionId, selection]) => {
+      const option = itemOptions.find((o) => o.id === optionId)
+      if (!option) return
+
+      if (Array.isArray(selection)) {
+        selection.forEach((choiceId) => {
+          const choice = option.item_option_choices.find((c) => c.id === choiceId)
+          if (choice?.price_modifier) {
+            price += Number(choice.price_modifier)
+          }
+        })
+      } else if (selection) {
+        const choice = option.item_option_choices.find((c) => c.id === selection)
+        if (choice?.price_modifier) {
+          price += Number(choice.price_modifier)
+        }
+      }
+    })
+
+    return price
+  }
+
+  // Build selected options display string
+  const buildSelectedOptionsDisplay = (): Record<string, string> => {
+    const display: Record<string, string> = {}
+
+    Object.entries(itemCustomizations).forEach(([optionId, selection]) => {
+      const option = itemOptions.find((o) => o.id === optionId)
+      if (!option) return
+
+      if (Array.isArray(selection)) {
+        const names = selection
+          .map((choiceId) => option.item_option_choices.find((c) => c.id === choiceId)?.name)
+          .filter(Boolean)
+          .join(", ")
+        if (names) display[option.category] = names
+      } else if (selection) {
+        const choice = option.item_option_choices.find((c) => c.id === selection)
+        if (choice) display[option.category] = choice.name
+      }
+    })
+
+    return display
+  }
+
+  // Add item to cart with options
+  const addItemToCart = () => {
+    if (!selectedItem) return
+
+    // Check required options
+    const missingRequired = itemOptions.filter((opt) => opt.is_required && !itemCustomizations[opt.id])
+    if (missingRequired.length > 0) {
+      alert(`Selecciona: ${missingRequired.map((o) => o.category || o.prompt).join(", ")}`)
+      return
+    }
+
+    const itemPrice = calculateItemPrice(selectedItem)
+    const selectedOptionsDisplay = buildSelectedOptionsDisplay()
+    
+    // Generate unique cart item ID based on item + selections + notes
+    const optionsKey = JSON.stringify(itemCustomizations) + itemNotes
+    const cartItemId = `${selectedItem.id}-${btoa(optionsKey)}`
+
+    // If item has notes, always add as new item (don't combine with same item without notes)
+    const existingIndex = itemNotes ? -1 : cart.findIndex((c) => c.id === cartItemId)
+    
+    if (existingIndex >= 0) {
+      setCart(cart.map((c, i) => i === existingIndex ? { ...c, quantity: c.quantity + 1 } : c))
+    } else {
+      setCart([
+        ...cart,
+        {
+          id: cartItemId,
+          itemId: selectedItem.id,
+          name: selectedItem.name,
+          price: itemPrice,
+          quantity: 1,
+          description: selectedItem.description,
+          selectedOptions: selectedOptionsDisplay,
+          customizations: { ...itemCustomizations },
+          notes: itemNotes || undefined,
+        },
+      ])
+    }
+
+    setSelectedItem(null)
+    setItemNotes("")
+    setShowItemNotes(false)
+    setItemOptions([])
+    setItemCustomizations({})
+    setIsCartOpen(true)
+  }
+
+  const updateQuantity = (id: string, delta: number) => {
+    setCart(
+      cart
+        .map((c) => (c.id === id ? { ...c, quantity: c.quantity + delta } : c))
+        .filter((c) => c.quantity > 0)
+    )
+  }
+
+  const removeFromCart = (id: string) => {
+    setCart(cart.filter((c) => c.id !== id))
+  }
+
+  const subtotal = cart.reduce((sum, item) => sum + item.price * item.quantity, 0)
+  const totalItems = cart.reduce((sum, item) => sum + item.quantity, 0)
+  
+  // Delivery fee already has subsidy deducted (calculatedDeliveryFee = displayedFee from API)
+  // So DELIVERY_FEE is what customer sees (e.g., $5.69 - $3 subsidy = $2.69)
+  const DELIVERY_FEE = calculatedDeliveryFee
+  
+  // Dispatch fee = percentage of subtotal + subsidy recovery (platform recovers subsidy here)
+  const DISPATCH_FEE_PERCENT = selectedRestaurant?.dispatch_fee_percent ?? 0
+  const DISPATCH_FEE = (subtotal * (DISPATCH_FEE_PERCENT / 100)) + deliverySubsidy
+  
+
+  
+  // Calculate delivery fee when address changes
+  useEffect(() => {
+    const calculateFee = async () => {
+      if (!selectedRestaurant || customerInfo.deliveryType !== "delivery") {
+        setCalculatedDeliveryFee(0)
+        setDeliveryDistance(0)
+        return
+      }
+      
+      // Need full address to calculate
+      if (!customerInfo.streetAddress || !customerInfo.city) {
+        setCalculatedDeliveryFee(0)
+        setDeliveryDistance(0)
+        return
+      }
+      
+      setIsCalculatingFee(true)
+      try {
+        // Get restaurant address from the selected branch or restaurant
+        const restaurantAddress = selectedRestaurant.address || 
+          `${selectedRestaurant.city || ""}, ${selectedRestaurant.state || "PR"}`
+        
+const line2 = customerInfo.streetAddress2 ? `, ${customerInfo.streetAddress2}` : ""
+        const deliveryAddress = `${customerInfo.streetAddress}${line2}, ${customerInfo.city}, ${customerInfo.state} ${customerInfo.zip || ""}`
+        
+        const result = await calculateDeliveryFee({
+          restaurantId: selectedRestaurant.id,
+          deliveryAddress,
+          restaurantAddress,
+          itemCount: totalItems,
+          customerLat: typeof customerInfo.latitude === "number" ? customerInfo.latitude : undefined,
+          customerLng: typeof customerInfo.longitude === "number" ? customerInfo.longitude : undefined,
+        })
+        
+        if (result.success) {
+          // Use displayedFee (subsidy-reduced) for customer-facing display
+          setCalculatedDeliveryFee(result.displayedFee)
+          setDeliveryDistance(result.distance)
+          setDeliverySubsidy(result.subsidy)
+        } else {
+          // Calculation failed - fetch minimum zone fee from delivery_zones table
+          const [settingsResult, zonesResult] = await Promise.all([
+            supabase.from("platform_settings").select("delivery_fee_subsidy").eq("tent", "online_ordering").single(),
+            supabase.from("delivery_zones").select("base_fee").eq("restaurant_id", selectedRestaurant.id).order("base_fee", { ascending: true }).limit(1)
+          ])
+          
+          const subsidy = Number(settingsResult.data?.delivery_fee_subsidy ?? 3.0)
+          // Use minimum zone fee, or fall back to 5.89 if no zones exist
+          const baseFee = zonesResult.data?.[0]?.base_fee ? Number(zonesResult.data[0].base_fee) : 5.89
+          const displayedFee = Math.max(0, baseFee - subsidy)
+          setCalculatedDeliveryFee(displayedFee)
+          setDeliveryDistance(0)
+          setDeliverySubsidy(subsidy)
+        }
+      } catch (error) {
+        console.error("Error calculating delivery fee:", error)
+        // No fallbacks - throw explicit error
+        throw new Error(`Failed to calculate delivery fee: ${error instanceof Error ? error.message : "Unknown error"}`)
+      } finally {
+        setIsCalculatingFee(false)
+      }
+    }
+    
+    // Debounce the calculation
+    const timer = setTimeout(calculateFee, 500)
+    return () => clearTimeout(timer)
+  }, [selectedRestaurant, customerInfo.streetAddress, customerInfo.streetAddress2, customerInfo.city, customerInfo.state, customerInfo.zip, customerInfo.latitude, customerInfo.longitude, customerInfo.deliveryType, totalItems])
+
+  // Search customers by phone or name for autocomplete
+  const searchCustomers = async (searchTerm: string) => {
+    if (searchTerm.length < 3) {
+      setCustomerSearchResults([])
+      setShowCustomerDropdown(false)
+      return
+    }
+    
+    setIsSearchingCustomers(true)
+    try {
+      // Search by phone, name, or email in customers table (simplified query without joins)
+      const { data: customersData, error: customersError } = await supabase
+        .from("customers")
+        .select("id, first_name, last_name, phone, email")
+        .or(`phone.ilike.%${searchTerm}%,first_name.ilike.%${searchTerm}%,last_name.ilike.%${searchTerm}%,email.ilike.%${searchTerm}%`)
+        .limit(5)
+      
+      if (customersError) throw customersError
+
+      // Also search profiles table for imported contacts
+      const { data: profilesData } = await supabase
+        .from("profiles")
+        .select("id, full_name, phone, email")
+        .or(`phone.ilike.%${searchTerm}%,full_name.ilike.%${searchTerm}%,email.ilike.%${searchTerm}%`)
+        .limit(5)
+
+      // Convert profiles to customer-like format and merge
+      const profilesAsCustomers = (profilesData || [])
+        .filter(p => {
+          // Exclude profiles that already exist in customers (by email or phone)
+          return !(customersData || []).some(c => 
+            (c.email && c.email === p.email) || (c.phone && c.phone === p.phone)
+          )
+        })
+        .map(p => ({
+          id: `profile_${p.id}`, // Prefix to distinguish from customer IDs
+          first_name: p.full_name?.split(" ")[0] || "",
+          last_name: p.full_name?.split(" ").slice(1).join(" ") || "",
+          phone: p.phone,
+          email: p.email,
+          customer_addresses: [],
+          customer_payment_methods: [],
+          _isProfile: true, // Flag to indicate this came from profiles table
+        }))
+
+      // Add empty arrays for addresses/payments (will be fetched on selection)
+      const customersWithEmptyArrays = (customersData || []).map(c => ({
+        ...c,
+        customer_addresses: [],
+        customer_payment_methods: [],
+      }))
+
+      const allResults = [...customersWithEmptyArrays, ...profilesAsCustomers].slice(0, 8)
+      
+      setCustomerSearchResults(allResults)
+      setShowCustomerDropdown(allResults.length > 0)
+      setIsNewCustomer(allResults.length === 0)
+    } catch (error) {
+      console.error("Error searching customers:", error)
+      setCustomerSearchResults([])
+    } finally {
+      setIsSearchingCustomers(false)
+    }
+  }
+  
+  // Select a customer from autocomplete and fill in their info
+  const selectCustomer = async (customer: any) => {
+    // Set basic info immediately
+    setCustomerInfo({
+      ...customerInfo,
+      phone: (() => {
+        const p = customer.phone || ""
+        if (p.startsWith("+1") && p.length === 12) return p.slice(2)
+        if (p.startsWith("1") && p.length === 11) return p.slice(1)
+        return p
+      })(),
+      name: `${customer.first_name || ""} ${customer.last_name || ""}`.trim(),
+      email: customer.email || "",
+    })
+    setShowCustomerDropdown(false)
+    setCustomerSearchResults([])
+    setIsNewCustomer(false)
+
+    // If this is a profile (imported contact), just use basic info
+    if (customer._isProfile || String(customer.id).startsWith("profile_")) {
+      setSelectedCustomerId(null)
+      setCustomerAddresses([])
+      setCustomerPaymentMethods([])
+      return
+    }
+
+    setSelectedCustomerId(customer.id)
+
+    // Fetch addresses separately to avoid join ambiguity
+    const { data: addresses } = await supabase
+      .from("customer_addresses")
+      .select("id, address_line_1, address_line_2, city, state, postal_code, is_default, delivery_instructions")
+      .eq("customer_id", customer.id)
+
+    // Fetch payment methods separately
+    const { data: paymentMethods } = await supabase
+      .from("customer_payment_methods")
+      .select("id, card_brand, card_last_four, card_exp_month, card_exp_year, provider, provider_customer_id, provider_payment_method_id, is_default")
+      .eq("customer_id", customer.id)
+
+    const customerAddressesList = addresses || []
+    const customerPaymentMethodsList = paymentMethods || []
+
+    setCustomerAddresses(customerAddressesList)
+    setCustomerPaymentMethods(customerPaymentMethodsList)
+
+    // Find default address or first address and update form
+    const defaultAddress = customerAddressesList.find((a: any) => a.is_default) || customerAddressesList[0]
+    if (defaultAddress) {
+      setCustomerInfo(prev => ({
+        ...prev,
+        streetAddress: defaultAddress.address_line_1 || "",
+        streetAddress2: defaultAddress.address_line_2 || "",
+        city: defaultAddress.city || "",
+        state: defaultAddress.state || "PR",
+        zip: defaultAddress.postal_code || "",
+        specialInstructions: defaultAddress.delivery_instructions || prev.specialInstructions,
+      }))
+    }
+    
+    // Auto-select default payment method if available
+    const defaultPayment = customerPaymentMethodsList.find((pm: any) => pm.is_default)
+    if (defaultPayment) {
+      setSelectedPaymentMethodId(defaultPayment.id)
+    }
+  }
+  
+  // Save new customer to database
+  const saveNewCustomer = async () => {
+    if (!customerInfo.name || !customerInfo.phone) return null
+    
+    try {
+      const nameParts = customerInfo.name.trim().split(" ")
+      const firstName = nameParts[0] || ""
+      const lastName = nameParts.slice(1).join(" ") || ""
+      const normalizedPhone = customerInfo.phone.replace(/\D/g, "")
+      
+      // Check if customer already exists
+      const { data: existing } = await supabase
+        .from("customers")
+        .select("id")
+        .or(`phone.ilike.%${normalizedPhone}%`)
+        .single()
+      
+      if (existing) {
+        setSelectedCustomerId(existing.id)
+        return existing.id
+      }
+      
+      // Create new customer
+      const { data: newCustomer, error } = await supabase
+        .from("customers")
+        .insert({
+          first_name: firstName,
+          last_name: lastName,
+          phone: normalizedPhone,
+          email: customerInfo.email || null,
+        })
+        .select("id")
+        .single()
+      
+      if (error) throw error
+      
+      if (newCustomer) {
+        setSelectedCustomerId(newCustomer.id)
+        setIsNewCustomer(false)
+        
+        // If delivery address provided, save it
+        if (customerInfo.deliveryType === "delivery" && customerInfo.streetAddress) {
+          await supabase
+            .from("customer_addresses")
+            .insert({
+              customer_id: newCustomer.id,
+              address_line_1: customerInfo.streetAddress,
+              address_line_2: customerInfo.streetAddress2 || null,
+              city: customerInfo.city,
+              state: customerInfo.state || "PR",
+              postal_code: customerInfo.zip,
+              delivery_instructions: customerInfo.specialInstructions || null,
+              is_default: true,
+            })
+        }
+        
+        return newCustomer.id
+      }
+      return null
+    } catch (error) {
+      console.error("Error saving customer:", error)
+      return null
+    }
+  }
+  
+  // Filter restaurants by delivery zone when customer address changes
+  useEffect(() => {
+    const filterByDeliveryZone = async () => {
+      if (!customerInfo.streetAddress || !customerInfo.city || customerInfo.deliveryType !== "delivery") {
+        setZoneFilteredRestaurants(restaurants)
+        return
+      }
+      
+      const line2 = customerInfo.streetAddress2 ? `, ${customerInfo.streetAddress2}` : ""
+      const deliveryAddress = `${customerInfo.streetAddress}${line2}, ${customerInfo.city}, ${customerInfo.state} ${customerInfo.zip || ""}`
+      
+      // Check each restaurant's delivery zones
+      const available: Restaurant[] = []
+      for (const restaurant of restaurants) {
+        if (!restaurant.address) {
+          available.push(restaurant) // Include if no address configured
+          continue
+        }
+        
+        const result = await calculateDeliveryFee({
+          restaurantId: restaurant.id,
+          deliveryAddress,
+          restaurantAddress: restaurant.address,
+          itemCount: 1,
+          customerLat: typeof customerInfo.latitude === "number" ? customerInfo.latitude : undefined,
+          customerLng: typeof customerInfo.longitude === "number" ? customerInfo.longitude : undefined,
+        })
+        
+        if (result.success) {
+          available.push(restaurant)
+        }
+      }
+      
+      setZoneFilteredRestaurants(available.length > 0 ? available : restaurants) // Fallback to all if none match
+    }
+    
+    const timer = setTimeout(filterByDeliveryZone, 800)
+    return () => clearTimeout(timer)
+  }, [customerInfo.streetAddress, customerInfo.streetAddress2, customerInfo.city, customerInfo.state, customerInfo.zip, customerInfo.latitude, customerInfo.longitude, customerInfo.deliveryType, restaurants])
+  
+  // Debounced customer search when phone changes
+  useEffect(() => {
+    if (selectedCustomerId) return // Don't search if customer already selected
+    
+    const timer = setTimeout(() => {
+      if (customerInfo.phone.length >= 3) {
+        searchCustomers(customerInfo.phone)
+      }
+    }, 300)
+    
+    return () => clearTimeout(timer)
+  }, [customerInfo.phone, selectedCustomerId])
+
+  // Filter menu items
+  const filteredMenuItems = menuItems.filter((item) =>
+    item.name.toLowerCase().includes(menuSearchTerm.toLowerCase()) ||
+    item.description?.toLowerCase().includes(menuSearchTerm.toLowerCase())
+  )
+
+  // Group menu items by category
+  const groupedItemsUnsorted = filteredMenuItems.reduce((acc, item) => {
+    const cat = item.categories?.name || "Otros"
+    if (!acc[cat]) acc[cat] = []
+    acc[cat].push(item)
+    return acc
+  }, {} as Record<string, any[]>)
+
+  // Define category display order (appetizers first, desserts/drinks last)
+  const categoryOrder = [
+    "MOST POPULAR",
+    "APERITIVOS",
+    "ANTOJITOS MEXICANOS",
+    "ESPECIALIDADES",
+    "CARNES",
+    "CARNES ESTILO AURORITA",
+    "FAMOSAS FAJITAS",
+    "TACOS",
+    "BURRITOS",
+    "ENCHILADAS",
+    "QUESADILLAS",
+    "COMBINACIONES",
+    "DEL MAR",
+    "VEGETARIANO",
+    "PARA NIÑOS",
+    "ORDENES ADICIONALES",
+    "POSTRES",
+    "BEBIDAS NO ALCOHOLICAS",
+    "MARGARITAS Y BEBIDAS",
+    "OTROS"
+  ]
+
+  // Sort categories by defined order, unknown categories go at the end
+  const groupedItems = Object.fromEntries(
+    Object.entries(groupedItemsUnsorted).sort(([a], [b]) => {
+      const aIndex = categoryOrder.findIndex(c => a.toUpperCase().includes(c) || c.includes(a.toUpperCase()))
+      const bIndex = categoryOrder.findIndex(c => b.toUpperCase().includes(c) || c.includes(b.toUpperCase()))
+      const aOrder = aIndex === -1 ? 999 : aIndex
+      const bOrder = bIndex === -1 ? 999 : bIndex
+      return aOrder - bOrder
+    })
+  )
+
+  // CSR orders must carry a customer email so the order can be linked to a
+  // customers row (via auth_user_id OR email fallback — see Phase 1
+  // customer-resolution in check-payment-status / athmovil actions).
+  // Without an email, orders become orphaned and can't be attached when
+  // the customer later signs in with the same address.
+  const emailValid =
+    !!customerInfo.email &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customerInfo.email.trim())
+
+  return (
+    <div className="min-h-screen bg-slate-100">
+      {/* Header */}
+      <header className="bg-slate-800 text-white sticky top-0 z-50">
+        <div className="px-2 h-10 flex items-center justify-between">
+<div className="flex items-center gap-2">
+<button
+  type="button"
+  onClick={() => {
+    router.push("/csr")
+    router.refresh()
+  }}
+  className="p-1 hover:bg-slate-700 rounded flex items-center gap-1 text-xs text-slate-300 hover:text-white"
+  title="Volver a Dispatch"
+  >
+  <ArrowLeft className="w-4 h-4" />
+  </button>
+  <button
+  onClick={() => setIsRestaurantPanelOpen(!isRestaurantPanelOpen)}
+  className="p-1 hover:bg-slate-700 rounded"
+  >
+  <Menu className="w-4 h-4" />
+  </button>
+  <div className="flex items-center gap-1.5">
+  <Phone className="w-3.5 h-3.5 text-rose-400" />
+  <span className="text-xs font-bold">CSR Portal</span>
+  </div>
+            {selectedRestaurant && (
+              <span className="text-xs text-slate-300 ml-2">
+                | {selectedRestaurant.name}
+              </span>
+            )}
+          </div>
+
+          <div className="flex items-center gap-2">
+            {selectedRestaurant && (
+              <button
+                onClick={() => setIsCartOpen(true)}
+                className="relative p-1.5 hover:bg-slate-700 rounded flex items-center gap-1"
+              >
+                <ShoppingCart className="w-4 h-4" />
+                <span className="text-xs">${subtotal.toFixed(2)}</span>
+                {totalItems > 0 && (
+                  <span className="absolute -top-1 -right-1 w-4 h-4 bg-rose-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center">
+                    {totalItems}
+                  </span>
+                )}
+              </button>
+            )}
+            <Link href="/csr" className="px-3 py-1.5 text-xs font-medium bg-teal-600 hover:bg-teal-700 text-white rounded">
+              Dispatch
+            </Link>
+            <Link href="/csr/menus" className="px-3 py-1.5 text-xs font-medium bg-slate-600 hover:bg-slate-500 text-white rounded">
+              Menús
+            </Link>
+            <Link href="/super-admin" className="px-3 py-1.5 text-xs font-medium border border-amber-500 text-amber-400 hover:bg-amber-500 hover:text-white rounded">
+              Super Admin
+            </Link>
+          </div>
+        </div>
+      </header>
+
+      {/* Main Layout - Everything visible at once */}
+      <div className="flex h-[calc(100vh-40px)]">
+        
+        {/* LEFT SLIDEOUT: Restaurant Selector (visible by default with collapse arrow) */}
+        <div className={`bg-white border-r border-slate-200 transition-all duration-300 overflow-hidden flex-shrink-0 relative ${
+          isRestaurantPanelOpen ? "w-48" : "w-0"
+        }`}>
+          {/* Collapse arrow */}
+          {isRestaurantPanelOpen && (
+            <button
+              onClick={() => setIsRestaurantPanelOpen(false)}
+              className="absolute -right-3 top-1/2 -translate-y-1/2 z-10 w-6 h-12 bg-white border border-slate-200 rounded-r-lg flex items-center justify-center hover:bg-slate-50 shadow-sm"
+            >
+              <ChevronLeft className="w-4 h-4 text-slate-500" />
+            </button>
+          )}
+          <div className="w-48 h-full flex flex-col">
+            {/* Tent Selector Toggle */}
+            <div className="p-1.5 border-b border-slate-200 bg-slate-50">
+              <div className="flex rounded-md overflow-hidden border border-slate-200">
+                <button
+                  onClick={() => setActiveTent("online_ordering")}
+                  className={`flex-1 px-2 py-1 text-[10px] font-medium transition-colors ${
+                    activeTent === "online_ordering"
+                      ? "bg-blue-600 text-white"
+                      : "bg-white text-slate-600 hover:bg-slate-100"
+                  }`}
+                >
+                  Delivery
+                </button>
+                <button
+                  onClick={() => setActiveTent("catering")}
+                  className={`flex-1 px-2 py-1 text-[10px] font-medium transition-colors ${
+                    activeTent === "catering"
+                      ? "bg-orange-500 text-white"
+                      : "bg-white text-slate-600 hover:bg-slate-100"
+                  }`}
+                >
+                  Catering
+                </button>
+              </div>
+            </div>
+            <div className="p-2 border-b border-slate-200">
+              <div className="relative">
+                <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-slate-400" />
+                <Input
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                  placeholder="Buscar..."
+                  className="pl-6 h-7 text-xs"
+                />
+              </div>
+            </div>
+            <div className="flex-1 overflow-y-auto">
+              {activeTent === "online_ordering" ? (
+                // Online Ordering restaurants
+                filteredRestaurants.map((restaurant) => {
+                  const isBlockedPOP = isPOPBlocked && restaurant.payment_type === 'pop' && !restaurant.block_override
+                  return (
+                    <button
+                      key={restaurant.id}
+                      className={`w-full text-left px-2 py-1.5 text-xs border-b border-slate-100 transition-colors ${
+                        isBlockedPOP 
+                          ? "bg-slate-100 text-slate-400 cursor-not-allowed opacity-60" 
+                          : selectedRestaurant?.id === restaurant.id 
+                            ? "bg-rose-100 text-rose-700 font-medium" 
+                            : "text-slate-700 hover:bg-rose-50"
+                      }`}
+                      onClick={() => !isBlockedPOP && selectRestaurant(restaurant)}
+                      disabled={isBlockedPOP}
+                    >
+                      <div className="truncate font-medium flex items-center gap-1">
+                        {restaurant.name}
+                        {isBlockedPOP && <span className="text-[9px] text-red-500 font-normal">(POP Bloqueado)</span>}
+                      </div>
+                      {restaurant.area && (
+                        <div className="text-[10px] text-slate-400 truncate">{restaurant.area}</div>
+                      )}
+                    </button>
+                  )
+                })
+              ) : (
+                // Catering restaurants
+                cateringRestaurants
+                  .filter((r) => r.name.toLowerCase().includes(searchTerm.toLowerCase()))
+                  .map((restaurant) => (
+                    <button
+                      key={restaurant.id}
+                      className={`w-full text-left px-2 py-1.5 text-xs border-b border-slate-100 transition-colors ${
+                        selectedCateringRestaurant?.id === restaurant.id 
+                          ? "bg-orange-100 text-orange-700 font-medium" 
+                          : "text-slate-700 hover:bg-orange-50"
+                      }`}
+                      onClick={() => selectCateringRestaurant(restaurant)}
+                    >
+                      <div className="truncate font-medium">{restaurant.name}</div>
+                      {restaurant.cuisine_type && (
+                        <div className="text-[10px] text-slate-400 truncate">{restaurant.cuisine_type}</div>
+                      )}
+                    </button>
+                  ))
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Expand arrow when restaurant panel is collapsed */}
+        {!isRestaurantPanelOpen && (
+          <button
+            onClick={() => setIsRestaurantPanelOpen(true)}
+            className="w-6 h-12 bg-white border border-slate-200 rounded-r-lg flex items-center justify-center hover:bg-slate-50 shadow-sm self-center flex-shrink-0"
+          >
+            <ChevronRight className="w-4 h-4 text-slate-500" />
+          </button>
+        )}
+
+        {/* CENTER: Customer Info + Menu */}
+        <div className="flex-1 flex min-w-0">
+          
+          {/* Customer Info Panel - Always Visible */}
+          <div className="w-64 flex-shrink-0 bg-white border-r border-amber-200 overflow-y-auto">
+            <div className="p-2 border-b border-amber-200 bg-amber-100">
+              <h3 className="text-sm font-bold text-amber-800 flex items-center gap-1.5">
+                <User className="w-4 h-4" />
+                Info Cliente
+              </h3>
+            </div>
+            <div className="p-2 space-y-2">
+              {/* Buscar Cliente */}
+              <div className="border border-slate-200 rounded-md p-2 bg-white">
+                <Label className="text-xs text-slate-700 font-semibold">Buscar Cliente</Label>
+                <div className="mt-1 flex gap-2">
+                  <Input
+                    value={customerSearchQuery}
+                    onChange={(e) => setCustomerSearchQuery(e.target.value)}
+                    placeholder="Buscar por nombre, email o teléfono"
+                    className="h-8 text-sm"
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => {
+                      setShowCustomerDropdown(false)
+                      searchCustomers(customerSearchQuery)
+                    }}
+                    className="h-8 px-2"
+                    disabled={isSearchingCustomers}
+                    title="Buscar"
+                  >
+                    <Search className="w-4 h-4" />
+                  </Button>
+                </div>
+
+                {customerSearchResults.length > 0 && (
+                  <div className="mt-2 space-y-2">
+                    {customerSearchResults.map((customer) => (
+                      <button
+                        key={customer.id}
+                        type="button"
+                        onClick={() => selectCustomer(customer)}
+                        className="w-full text-left border border-slate-200 rounded-md p-2 hover:bg-amber-50 transition-colors"
+                      >
+                        <div className="text-xs font-semibold text-slate-900">
+                          {`${customer.first_name || ""} ${customer.last_name || ""}`.trim() || "Cliente"}
+                        </div>
+                        <div className="text-[11px] text-slate-600">
+                          {customer.email || "Sin email"} · {customer.phone || "Sin teléfono"}
+                        </div>
+                        <div className="text-[10px] text-slate-500 mt-1">
+                          Direcciones guardadas: {Array.isArray(customer.customer_addresses) ? customer.customer_addresses.length : 0}
+                        </div>
+                        {customer.customer_addresses?.[0] && (
+                          <div className="text-[10px] text-slate-400 truncate">
+                            {customer.customer_addresses[0].address_line_1}, {customer.customer_addresses[0].city}
+                          </div>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Phone with autocomplete */}
+              <div className="relative">
+                <Label className="text-xs text-slate-700 font-semibold">Telefono *</Label>
+                <div className="relative">
+                  <Input
+                    value={customerInfo.phone}
+                    onChange={(e) => {
+                      setSelectedCustomerId(null) // Clear selected customer when typing
+                      setCustomerInfo({...customerInfo, phone: e.target.value})
+                    }}
+                    onFocus={() => customerSearchResults.length > 0 && setShowCustomerDropdown(true)}
+                    placeholder="787-XXX-XXXX"
+                    className="h-8 text-sm mt-0.5"
+                  />
+                  {isSearchingCustomers && (
+                    <div className="absolute right-2 top-1/2 -translate-y-1/2">
+                      <div className="w-3 h-3 border border-amber-500 border-t-transparent rounded-full animate-spin" />
+                    </div>
+                  )}
+                </div>
+                
+                {/* Customer autocomplete dropdown */}
+                {showCustomerDropdown && customerSearchResults.length > 0 && (
+                  <div className="absolute z-50 w-full mt-1 bg-white border border-slate-200 rounded-md shadow-lg max-h-48 overflow-y-auto">
+                    {customerSearchResults.map((customer) => (
+                      <button
+                        key={customer.id}
+                        onClick={() => selectCustomer(customer)}
+                        className="w-full px-2 py-1.5 text-left hover:bg-amber-50 border-b border-slate-100 last:border-b-0"
+                      >
+                        <div className="text-xs font-medium text-slate-900">
+                          {customer.first_name} {customer.last_name}
+                        </div>
+                        <div className="text-[10px] text-slate-500 flex gap-2">
+                          <span>{customer.phone}</span>
+                          {customer.email && <span>| {customer.email}</span>}
+                        </div>
+                        {customer.customer_addresses?.[0] && (
+                          <div className="text-[10px] text-slate-400 truncate">
+                            {customer.customer_addresses[0].address_line_1}, {customer.customer_addresses[0].city}
+                          </div>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+              
+              {/* Name */}
+              <div>
+                <Label className="text-xs text-slate-700 font-semibold">Nombre *</Label>
+                <Input
+                  value={customerInfo.name}
+                  onChange={(e) => {
+                    setSelectedCustomerId(null) // Clear selected customer when typing
+                    setCustomerInfo({...customerInfo, name: e.target.value})
+                  }}
+                  placeholder="Nombre completo"
+                  className="h-8 text-sm mt-0.5"
+                />
+                {selectedCustomerId && (
+                  <p className="text-[9px] text-green-600 mt-0.5">Cliente registrado</p>
+                )}
+                {isNewCustomer && !selectedCustomerId && customerInfo.phone.length >= 7 && (
+                  <p className="text-[9px] text-amber-600 mt-0.5">Nuevo cliente</p>
+                )}
+              </div>
+              
+              {/* Email (required — needed to link order to customer record) */}
+              <div>
+                <Label className="text-xs text-slate-700 font-semibold">Email *</Label>
+                <Input
+                  type="email"
+                  value={customerInfo.email}
+                  onChange={(e) => setCustomerInfo({...customerInfo, email: e.target.value})}
+                  placeholder="email@ejemplo.com"
+                  className={`h-8 text-sm mt-0.5 ${
+                    customerInfo.email && !emailValid ? "border-red-400 focus-visible:ring-red-400" : ""
+                  }`}
+                />
+                {!customerInfo.email && (
+                  <p className="text-[9px] text-amber-600 mt-0.5">
+                    Requerido — se usa para vincular la orden al cliente
+                  </p>
+                )}
+                {customerInfo.email && !emailValid && (
+                  <p className="text-[9px] text-red-600 mt-0.5">Email no válido</p>
+                )}
+                {selectedCustomerId && customerInfo.email && emailValid && (
+                  <p className="text-[9px] text-green-600 mt-0.5">Email en archivo</p>
+                )}
+              </div>
+              
+              <div className="flex gap-1">
+                <button
+                  onClick={() => setCustomerInfo({...customerInfo, deliveryType: "delivery"})}
+                  className={`flex-1 py-1.5 text-xs font-semibold rounded ${
+                    customerInfo.deliveryType === "delivery" 
+                      ? activeTent === "catering" ? "bg-orange-500 text-white" : "bg-amber-600 text-white"
+                      : activeTent === "catering" ? "bg-white text-orange-700 border border-orange-300" : "bg-white text-amber-700 border border-amber-300"
+                  }`}
+                >
+                  {activeTent === "catering" ? "Entrega" : "Delivery"}
+                </button>
+                <button
+                  onClick={() => setCustomerInfo({...customerInfo, deliveryType: "pickup"})}
+                  className={`flex-1 py-1.5 text-xs font-semibold rounded ${
+                    customerInfo.deliveryType === "pickup" 
+                      ? activeTent === "catering" ? "bg-orange-500 text-white" : "bg-amber-600 text-white"
+                      : activeTent === "catering" ? "bg-white text-orange-700 border border-orange-300" : "bg-white text-amber-700 border border-amber-300"
+                  }`}
+                >
+                  {activeTent === "catering" ? "Recogido" : "Pickup"}
+                </button>
+              </div>
+
+              {customerInfo.deliveryType === "delivery" && (
+                <>
+                  {/* Address Line 1 with Google Autocomplete + Ubicarme */}
+                  <div>
+                    <div className="flex items-center justify-between">
+                      <Label className="text-xs text-slate-700 font-semibold">Direccion *</Label>
+                      <LocateMeButton
+                        onLocated={(lat, lng) => {
+                          setCustomerInfo(prev => ({ ...prev, latitude: lat, longitude: lng }))
+                          // Fresh GPS coords always require the CSR to verify
+                          // the pin sits on the correct rooftop before submit.
+                          setAddressConfidence("low")
+                          setPinConfirmed(false)
+                        }}
+                        onAddressResolved={(addr) => {
+                          const c = addr.components || {}
+                          const nextStreet = addr.streetAddress || c.route || ""
+                          setCustomerInfo(prev => ({
+                            ...prev,
+                            streetAddress: nextStreet || prev.streetAddress,
+                            city: c.city || prev.city,
+                            state: c.state || prev.state || "PR",
+                            zip: c.postalCode || prev.zip,
+                          }))
+                          if (c.streetNumber && c.route) {
+                            setAddressConfidence("high")
+                          }
+                        }}
+                      />
+                    </div>
+                    <AddressAutocomplete
+                      value={customerInfo.streetAddress}
+                      onChange={(val) => setCustomerInfo(prev => ({...prev, streetAddress: val}))}
+                      onAddressSelected={(components: AddressComponents) => {
+                        // ALWAYS override city/state/zip when selecting from autocomplete
+                        setCustomerInfo(prev => ({
+                          ...prev,
+                          streetAddress: components.streetAddress,
+                          city: components.city,
+                          state: components.state || "PR",
+                          zip: components.zip,
+                          latitude: typeof components.latitude === "number" ? components.latitude : null,
+                          longitude: typeof components.longitude === "number" ? components.longitude : null,
+                        }))
+                        // Low-confidence picks (landmark centroids, POIs)
+                        // force explicit pin confirmation before the CSR
+                        // can submit the order.
+                        setAddressConfidence(components.confidence === "low" ? "low" : "high")
+                        setPinConfirmed(false)
+                      }}
+                      placeholder="Numero, Calle..."
+                      className="h-8 text-sm mt-0.5"
+                    />
+                  </div>
+                  
+                  {/* Address Line 2 — also acts as a secondary autocomplete
+                      so a CSR can search by building/condo name (e.g.
+                      "Condominio Altomonte"). On pick it fills Line 1 +
+                      city/state/zip + coords just like Line 1, then clears
+                      itself so the CSR can type the real apt/unit. */}
+                  <div>
+                    <Label className="text-xs text-slate-700 font-semibold">Apt, Urb, Suite</Label>
+                    <AddressAutocomplete
+                      value={customerInfo.streetAddress2}
+                      onChange={(val) => setCustomerInfo(prev => ({...prev, streetAddress2: val}))}
+                      onAddressSelected={(components: AddressComponents) => {
+                        setCustomerInfo(prev => ({
+                          ...prev,
+                          streetAddress: components.streetAddress,
+                          streetAddress2: "",
+                          city: components.city,
+                          state: components.state || "PR",
+                          zip: components.zip,
+                          latitude: typeof components.latitude === "number" ? components.latitude : null,
+                          longitude: typeof components.longitude === "number" ? components.longitude : null,
+                        }))
+                        setAddressConfidence(components.confidence === "low" ? "low" : "high")
+                        setPinConfirmed(false)
+                      }}
+                      placeholder="Apt 2B, Urb Villa Sol, etc."
+                      className="h-8 text-sm mt-0.5"
+                      secondarySearch
+                    />
+                  </div>
+                  
+                  {/* City, State, and ZIP */}
+                  <div className="grid grid-cols-3 gap-1">
+                    <div>
+                      <Label className="text-xs text-slate-700 font-semibold">Ciudad *</Label>
+                      <Input
+                        value={customerInfo.city}
+                        onChange={(e) => setCustomerInfo({...customerInfo, city: e.target.value})}
+                        placeholder="San Juan"
+                        className="h-8 text-sm mt-0.5"
+                        required
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-xs text-slate-700 font-semibold">Estado *</Label>
+                      <Input
+                        value={customerInfo.state}
+                        onChange={(e) => setCustomerInfo({...customerInfo, state: e.target.value.toUpperCase().slice(0, 2)})}
+                        placeholder="PR"
+                        className="h-8 text-sm mt-0.5"
+                        maxLength={2}
+                        required
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-xs text-slate-700 font-semibold">ZIP *</Label>
+                      <Input
+                        value={customerInfo.zip}
+                        onChange={(e) => {
+                          // Only allow numeric input, max 5 digits
+                          const val = e.target.value.replace(/\D/g, "").slice(0, 5)
+                          setCustomerInfo({...customerInfo, zip: val})
+                        }}
+                        placeholder="00XXX"
+                        className="h-8 text-sm mt-0.5"
+                        required
+                      />
+                    </div>
+                  </div>
+                  
+                  {/* Pin confirmation — inline status strip + large Dialog.
+                      We keep the map/Street View out of the form itself so
+                      the CSR has a real canvas to work with. Status strip
+                      shows the current state (pending/confirmed) + an
+                      "Ajustar ubicacion" button that opens the dialog. */}
+                  {typeof customerInfo.latitude === "number" && typeof customerInfo.longitude === "number" && (
+                    <div className="mt-2">
+                      {pinConfirmed ? (
+                        <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 flex items-center gap-2">
+                          <svg className="w-4 h-4 text-emerald-600 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                          </svg>
+                          <span className="text-sm font-medium text-emerald-800 truncate">
+                            Ubicacion confirmada
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setPinConfirmed(false)
+                              setPinDialogOpen(true)
+                            }}
+                            className="ml-auto text-xs text-emerald-700 hover:text-emerald-900 underline"
+                            aria-label="Editar ubicacion"
+                          >
+                            Cambiar
+                          </button>
+                        </div>
+                      ) : (
+                        <div className={
+                          "rounded-lg border px-3 py-2 flex items-center gap-2 " +
+                          (addressConfidence === "low"
+                            ? "border-amber-300 bg-amber-50"
+                            : "border-slate-200 bg-slate-50")
+                        }>
+                          <MapPin className={
+                            "w-4 h-4 flex-shrink-0 " +
+                            (addressConfidence === "low" ? "text-amber-700" : "text-slate-600")
+                          } />
+                          <span className={
+                            "text-xs " +
+                            (addressConfidence === "low" ? "text-amber-800" : "text-slate-700")
+                          }>
+                            {addressConfidence === "low"
+                              ? "Confirma la ubicacion exacta en el mapa."
+                              : "Verifica el pin en el mapa antes de cobrar."}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setPinDialogOpen(true)}
+                            className={
+                              "ml-auto px-3 py-1 text-xs font-medium rounded-md text-white " +
+                              (addressConfidence === "low"
+                                ? "bg-amber-600 hover:bg-amber-700"
+                                : "bg-slate-900 hover:bg-slate-800")
+                            }
+                          >
+                            Ajustar ubicacion
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Pin-adjust dialog. Renders the existing
+                      DeliveryPinConfirm component at a generous size so the
+                      map + Street View have real canvas. Confirmar inside
+                      also closes the dialog. */}
+                  {typeof customerInfo.latitude === "number" && typeof customerInfo.longitude === "number" && (
+                    <Dialog open={pinDialogOpen} onOpenChange={setPinDialogOpen}>
+                      <DialogContent className="sm:max-w-5xl max-h-[92vh] overflow-y-auto">
+                        <DialogHeader>
+                          <DialogTitle>Ajustar ubicacion de entrega</DialogTitle>
+                        </DialogHeader>
+                        <DeliveryPinConfirm
+                          latitude={customerInfo.latitude}
+                          longitude={customerInfo.longitude}
+                          onChange={(lat, lng) => {
+                            setCustomerInfo(prev => ({ ...prev, latitude: lat, longitude: lng }))
+                          }}
+                          confidence={addressConfidence}
+                          heightPx={520}
+                          onConfirm={() => {
+                            setPinConfirmed(true)
+                            setPinDialogOpen(false)
+                          }}
+                          onUnconfirm={() => setPinConfirmed(false)}
+                          confirmed={pinConfirmed}
+                          onAddressResolved={(addr) => {
+                            const c = addr.components || {}
+                            const newStreet =
+                              addr.streetAddress ||
+                              (addr.formattedAddress || "").split(",")[0].trim()
+                            if (newStreet) {
+                              setCustomerInfo(prev => ({
+                                ...prev,
+                                streetAddress: newStreet,
+                                city: c.city || prev.city,
+                                state: c.state || prev.state || "PR",
+                                zip: c.postalCode || prev.zip,
+                              }))
+                            }
+                          }}
+                        />
+                      </DialogContent>
+                    </Dialog>
+                  )}
+                </>
+              )}
+
+              {/* Branch selector removed - each restaurant is a unit */}
+
+              <div className="grid grid-cols-2 gap-1">
+                <div>
+                  <Label className="text-xs text-slate-700 font-semibold">
+                    {activeTent === "catering" ? "Fecha del Evento *" : "Fecha"}
+                  </Label>
+                  <Input
+                    type="date"
+                    value={customerInfo.eventDate}
+                    onChange={(e) => setCustomerInfo({...customerInfo, eventDate: e.target.value})}
+                    className="h-8 text-sm mt-0.5"
+                    min={activeTent === "catering" 
+                      ? new Date(Date.now() + (selectedCateringRestaurant?.default_lead_time_hours || 48) * 60 * 60 * 1000).toISOString().split('T')[0]
+                      : undefined
+                    }
+                    max={activeTent === "catering"
+                      ? new Date(Date.now() + (selectedCateringRestaurant?.max_advance_days || 21) * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+                      : undefined
+                    }
+                  />
+                </div>
+                <div>
+                  <Label className="text-xs text-slate-700 font-semibold">
+                    {activeTent === "catering" ? "Hora del Evento *" : "Hora"}
+                  </Label>
+                  <Input
+                    type="time"
+                    value={customerInfo.eventTime}
+                    onChange={(e) => setCustomerInfo({...customerInfo, eventTime: e.target.value})}
+                    className="h-8 text-sm mt-0.5"
+                  />
+                </div>
+              </div>
+
+              {/* Guest Count - Catering only */}
+              {activeTent === "catering" && (
+                <div>
+                  <Label className="text-xs text-slate-700 font-semibold">Cantidad de Invitados</Label>
+                  <Input
+                    type="number"
+                    min="1"
+                    value={customerInfo.guestCount}
+                    onChange={(e) => setCustomerInfo({...customerInfo, guestCount: e.target.value})}
+                    placeholder="Ej: 50"
+                    className="h-8 text-sm mt-0.5"
+                  />
+                </div>
+              )}
+
+              <div>
+                <Label className="text-xs text-slate-700 font-semibold">Instrucciones</Label>
+                <textarea
+                  value={customerInfo.specialInstructions}
+                  onChange={(e) => setCustomerInfo({...customerInfo, specialInstructions: e.target.value})}
+                  placeholder="Notas especiales..."
+                  className="w-full h-12 text-sm mt-0.5 p-1.5 border border-slate-200 rounded-md resize-none"
+                />
+              </div>
+              
+              {/* Payment Method Selection - Click to select AND open payment */}
+              <div>
+                <Label className="text-xs text-slate-700 font-semibold">Metodo de Pago</Label>
+                <div className="flex flex-col gap-1.5 mt-1">
+                  {/* Stripe button - always available (platform default) */}
+                  <button
+                    onClick={() => {
+                      setPaymentMethod("stripe")
+                      if (cart.length > 0 && customerInfo.name && customerInfo.phone && emailValid && selectedRestaurant) {
+                        setShowReadbackModal(true) // Go through read-back first
+                      }
+                    }}
+disabled={cart.length === 0 || !customerInfo.name || !customerInfo.phone || !emailValid || (activeTent === "online_ordering" ? !selectedRestaurant : !selectedCateringRestaurant) || (customerInfo.deliveryType === "delivery" && (!customerInfo.city || !customerInfo.state || !customerInfo.zip || !pinConfirmed))}
+                  className={`flex items-center gap-2 px-2 py-1.5 rounded border transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                  paymentMethod === "stripe"
+                        ? "bg-indigo-600 text-white border-indigo-600"
+                        : "bg-white text-slate-700 border-slate-300 hover:border-indigo-400"
+                    }`}
+                  >
+                    <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M13.976 9.15c-2.172-.806-3.356-1.426-3.356-2.409 0-.831.683-1.305 1.901-1.305 2.227 0 4.515.858 6.09 1.631l.89-5.494C18.252.975 15.697 0 12.165 0 9.667 0 7.589.654 6.104 1.872 4.56 3.147 3.757 4.992 3.757 7.218c0 4.039 2.467 5.76 6.476 7.219 2.585.92 3.445 1.574 3.445 2.583 0 .98-.84 1.545-2.354 1.545-1.875 0-4.965-.921-6.99-2.109l-.9 5.555C5.175 22.99 8.385 24 11.714 24c2.641 0 4.843-.624 6.328-1.813 1.664-1.305 2.525-3.236 2.525-5.732 0-4.128-2.524-5.851-6.591-7.305z"/>
+                    </svg>
+                    <span className="text-[10px] font-medium">Stripe (Tarjeta)</span>
+                  </button>
+                  
+                  {/* ATH Movil button - always available but shows warning if not configured */}
+                  <button
+                    onClick={() => {
+                      setPaymentMethod("ath_movil")
+                      if (cart.length > 0 && customerInfo.name && customerInfo.phone && emailValid && selectedRestaurant) {
+                        setShowReadbackModal(true) // Go through read-back first
+                      }
+                    }}
+disabled={cart.length === 0 || !customerInfo.name || !customerInfo.phone || !emailValid || (activeTent === "online_ordering" ? !selectedRestaurant : !selectedCateringRestaurant) || (customerInfo.deliveryType === "delivery" && (!customerInfo.city || !customerInfo.state || !customerInfo.zip || !pinConfirmed))}
+                  className={`flex items-center gap-2 px-2 py-1.5 rounded border transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                  paymentMethod === "ath_movil"
+                        ? "bg-orange-500 text-white border-orange-500"
+                        : "bg-white text-slate-700 border-slate-300 hover:border-orange-400"
+                    }`}
+                  >
+                    <div className="w-4 h-4 bg-orange-500 rounded flex items-center justify-center text-white text-[8px] font-bold">
+                      ATH
+                    </div>
+                    <span className="text-[10px] font-medium">
+                      ATH Movil
+                      {selectedRestaurant && !selectedRestaurant.athmovil_public_token && (
+                        <span className="text-amber-500 ml-1">(!)</span>
+                      )}
+                    </span>
+                  </button>
+                  
+                  {/* Cash on Delivery button */}
+                  <button
+                    onClick={() => {
+                      setPaymentMethod("cash")
+                      if (cart.length > 0 && customerInfo.name && customerInfo.phone && emailValid && selectedRestaurant) {
+                        // For cash, go directly to read-back confirmation
+                        setShowReadbackModal(true)
+                      }
+                    }}
+                    disabled={cart.length === 0 || !customerInfo.name || !customerInfo.phone || !emailValid || !selectedRestaurant || customerInfo.deliveryType !== "delivery" || !customerInfo.city || !customerInfo.state || !customerInfo.zip || !pinConfirmed}
+                    className={`flex items-center gap-2 px-2 py-1.5 rounded border transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                      paymentMethod === "cash"
+                        ? "bg-green-600 text-white border-green-600"
+                        : "bg-white text-slate-700 border-slate-300 hover:border-green-400"
+                    }`}
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 9V7a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2m2 4h10a2 2 0 002-2v-6a2 2 0 00-2-2H9a2 2 0 00-2 2v6a2 2 0 002 2zm7-5a2 2 0 11-4 0 2 2 0 014 0z" />
+                    </svg>
+                    <span className="text-[10px] font-medium">Efectivo</span>
+                  </button>
+                  
+                  {/* Card-on-File (only if customer has saved cards) */}
+                  {customerPaymentMethods.length > 0 && (
+                    <div className="border-t border-slate-200 pt-1.5 mt-1">
+                      <p className="text-[9px] text-slate-500 mb-1">Tarjetas guardadas:</p>
+                      {customerPaymentMethods.map((pm) => (
+                        <button
+                          key={pm.id}
+                          onClick={() => {
+                            setSelectedPaymentMethodId(pm.id)
+                            setPaymentMethod("saved_card")
+                            if (cart.length > 0 && customerInfo.name && customerInfo.phone && emailValid && selectedRestaurant) {
+                              setShowReadbackModal(true)
+                            }
+                          }}
+                          disabled={cart.length === 0 || !customerInfo.name || !customerInfo.phone || !emailValid || !selectedRestaurant || (customerInfo.deliveryType === "delivery" && !pinConfirmed)}
+                          className={`w-full flex items-center gap-2 px-2 py-1 rounded border transition-colors disabled:opacity-50 disabled:cursor-not-allowed mb-1 ${
+                            selectedPaymentMethodId === pm.id && paymentMethod === "saved_card"
+                              ? "bg-indigo-100 text-indigo-700 border-indigo-300"
+                              : "bg-white text-slate-600 border-slate-200 hover:border-indigo-300"
+                          }`}
+                        >
+                          <span className="text-[10px] font-medium uppercase">{pm.card_brand}</span>
+                          <span className="text-[10px]">•••• {pm.card_last_four}</span>
+                          <span className="text-[9px] text-slate-400 ml-auto">{pm.card_exp_month}/{pm.card_exp_year}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                {customerInfo.deliveryType !== "delivery" && (
+                  <p className="text-[9px] text-slate-400 mt-1">
+                    Efectivo solo disponible para delivery
+                  </p>
+                )}
+                {(cart.length === 0 || !customerInfo.name || !customerInfo.phone || !emailValid) && (
+                  <p className="text-[9px] text-amber-600 mt-1">
+                    {cart.length === 0
+                      ? "Agrega items al carrito"
+                      : !customerInfo.name || !customerInfo.phone
+                      ? "Completa nombre y telefono"
+                      : "Completa el email del cliente"}
+                  </p>
+                )}
+{(activeTent === "online_ordering" ? !selectedRestaurant : !selectedCateringRestaurant) && (
+                  <p className="text-[9px] text-amber-600 mt-1">
+                    Selecciona un restaurante
+                  </p>
+                  )}
+              </div>
+            </div>
+          </div>
+
+          {/* Menu Panel */}
+          <div className="flex-1 min-w-0 flex flex-col bg-white">
+            {(activeTent === "online_ordering" ? !selectedRestaurant : !selectedCateringRestaurant) ? (
+              <div className="flex-1 flex items-center justify-center text-slate-400">
+                <div className="text-center">
+                  <Building2 className="w-10 h-10 mx-auto mb-2 opacity-30" />
+                  <p className="text-sm">Selecciona un restaurante</p>
+                </div>
+              </div>
+            ) : loading ? (
+              <div className="flex-1 flex items-center justify-center">
+                <div className="w-6 h-6 border-2 border-rose-200 border-t-rose-500 rounded-full animate-spin" />
+              </div>
+            ) : activeTent === "online_ordering" ? (
+              <>
+                {/* DELIVERY MENU - Menu Header with Fast Type-ahead Search */}
+                <div className="p-2 border-b border-slate-200 flex items-center gap-2">
+                  <h3 className="text-xs font-bold text-slate-800">{selectedRestaurant?.name}</h3>
+                  <div className="relative flex-1 max-w-xs">
+                    <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-slate-400" />
+                    <Input
+                      value={menuSearchTerm}
+                      onChange={(e) => setMenuSearchTerm(e.target.value)}
+                      placeholder="Buscar item rapido..."
+                      className="pl-6 h-6 text-[10px]"
+                      autoFocus
+                    />
+                    {/* Type-ahead dropdown for quick item selection */}
+                    {menuSearchTerm.length >= 2 && filteredMenuItems.length > 0 && filteredMenuItems.length <= 10 && (
+                      <div className="absolute top-full left-0 right-0 mt-1 bg-white border border-slate-200 rounded-md shadow-lg z-50 max-h-60 overflow-y-auto">
+                        {filteredMenuItems.slice(0, 8).map((item) => (
+                          <button
+                            key={item.id}
+                            onClick={() => {
+                              openItemDetail(item)
+                              setMenuSearchTerm("")
+                            }}
+                            className="w-full text-left px-2 py-1.5 hover:bg-rose-50 border-b border-slate-100 last:border-0 flex items-center justify-between"
+                          >
+                            <div>
+                              <span className="text-xs font-medium text-slate-800">{item.name}</span>
+                              {item.categories?.name && (
+                                <span className="text-[9px] text-slate-400 ml-1">({item.categories.name})</span>
+                              )}
+                            </div>
+                            <span className="text-xs font-semibold text-amber-600">${Number(item.price).toFixed(2)}</span>
+                          </button>
+                        ))}
+                        {filteredMenuItems.length > 8 && (
+                          <div className="px-2 py-1 text-[9px] text-slate-400 text-center bg-slate-50">
+                            +{filteredMenuItems.length - 8} mas resultados
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+<button
+                onClick={clearSelection}
+                className="text-[10px] text-slate-500 hover:text-rose-600"
+              >
+                Cambiar
+              </button>
+              
+              {/* Internal Shop Button */}
+              {internalShopItems.length > 0 && (
+                <div className="relative ml-2">
+                  <button
+                    onClick={() => setShowInternalShop(!showInternalShop)}
+                    className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium transition-colors ${
+                      showInternalShop 
+                        ? 'bg-purple-600 text-white' 
+                        : 'bg-purple-100 text-purple-700 hover:bg-purple-200'
+                    }`}
+                  >
+                    <Package className="w-3 h-3" />
+                    Tienda Interna
+                    {cart.filter(c => c.isInternalShop).length > 0 && (
+                      <span className="ml-1 w-4 h-4 bg-purple-800 text-white text-[9px] rounded-full flex items-center justify-center">
+                        {cart.filter(c => c.isInternalShop).reduce((sum, c) => sum + c.quantity, 0)}
+                      </span>
+                    )}
+                  </button>
+                  
+                  {/* Dropdown */}
+                  {showInternalShop && (
+                    <div className="absolute top-full right-0 mt-1 w-64 bg-white border border-purple-200 rounded-lg shadow-xl z-50 max-h-80 overflow-y-auto">
+<div className="p-2 bg-purple-50 border-b border-purple-200 flex items-center justify-between">
+  <span className="text-[10px] font-bold text-purple-700">Productos Disponibles</span>
+  <button onClick={() => setShowInternalShop(false)} className="text-purple-400 hover:text-purple-600">
+  <X className="w-3 h-3" />
+  </button>
+  </div>
+                      <div className="p-2 space-y-1">
+                        {internalShopItems.map((item) => {
+                          const inCart = cart.filter((c) => c.itemId === `shop-${item.id}`)
+                          const totalQty = inCart.reduce((sum, c) => sum + c.quantity, 0)
+                          return (
+                            <button
+                              key={item.id}
+                              className="w-full flex items-center justify-between p-2 rounded hover:bg-purple-50 text-left"
+                              onClick={() => {
+                                const cartItem: CartItem = {
+                                  id: `shop-${item.id}-${Date.now()}`,
+                                  itemId: `shop-${item.id}`,
+                                  name: `[Tienda] ${item.name}`,
+                                  price: Number(item.price),
+                                  quantity: 1,
+                                  description: item.description,
+                                  selectedOptions: {},
+                                  notes: "",
+                                  isInternalShop: true
+                                }
+                                setCart(prev => [...prev, cartItem])
+                                setIsCartOpen(true)
+                              }}
+                            >
+                              <div className="flex-1 min-w-0">
+                                <p className="text-[11px] font-medium text-purple-800 truncate">{item.name}</p>
+                                <p className="text-[10px] text-slate-500">${Number(item.price).toFixed(2)}</p>
+                              </div>
+                              {totalQty > 0 && (
+                                <span className="ml-2 w-5 h-5 bg-purple-600 text-white text-[10px] font-bold rounded-full flex items-center justify-center">
+                                  {totalQty}
+                                </span>
+                              )}
+                            </button>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+                {/* Category Tab Bar — horizontally scrollable, with column selector pinned right */}
+                <div className="border-b border-slate-200 bg-white flex items-center">
+                  <div className="flex items-center gap-1 overflow-x-auto px-2 py-1.5 scrollbar-thin flex-1 min-w-0">
+                    <button
+                      onClick={() => setSelectedMenuCategory("TODO")}
+                      className={`shrink-0 px-3 py-1 rounded-md text-xs font-semibold uppercase tracking-wide transition-colors ${
+                        selectedMenuCategory === "TODO"
+                          ? "bg-rose-500 text-white"
+                          : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                      }`}
+                    >
+                      Todo
+                    </button>
+                    {Object.keys(groupedItems).map((category) => (
+                      <button
+                        key={category}
+                        onClick={() => setSelectedMenuCategory(category)}
+                        className={`shrink-0 px-3 py-1 rounded-md text-xs font-semibold uppercase tracking-wide transition-colors ${
+                          selectedMenuCategory === category
+                            ? "bg-rose-500 text-white"
+                            : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                        }`}
+                        title={category}
+                      >
+                        {category}
+                      </button>
+                    ))}
+                  </div>
+                  {/* Column count selector — only relevant when viewing a single category */}
+                  {selectedMenuCategory !== "TODO" && (
+                    <div className="shrink-0 flex items-center gap-0.5 px-2 py-1.5 border-l border-slate-200 bg-slate-50">
+                      <span className="text-[10px] text-slate-500 mr-1 uppercase tracking-wide">Cols</span>
+                      {([1, 2, 3] as const).map((n) => (
+                        <button
+                          key={n}
+                          onClick={() => setMenuColumnCount(n)}
+                          className={`w-6 h-6 rounded text-[11px] font-semibold transition-colors ${
+                            menuColumnCount === n
+                              ? "bg-rose-500 text-white"
+                              : "bg-white text-slate-600 hover:bg-slate-200 border border-slate-200"
+                          }`}
+                          title={`${n} columna${n > 1 ? "s" : ""}`}
+                        >
+                          {n}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {/* Bulk collapse/expand — only relevant in Todo view. */}
+                  {selectedMenuCategory === "TODO" && Object.keys(groupedItems).length > 0 && (
+                    <div className="shrink-0 px-2 py-1.5 border-l border-slate-200 bg-slate-50">
+                      {(() => {
+                        const total = Object.keys(groupedItems).length
+                        const allCollapsed = collapsedCategories.size >= total
+                        return (
+                          <button
+                            onClick={() => {
+                              if (allCollapsed) {
+                                setCollapsedCategories(new Set())
+                              } else {
+                                setCollapsedCategories(new Set(Object.keys(groupedItems)))
+                              }
+                            }}
+                            className="text-[10px] text-slate-600 uppercase tracking-wide px-2 py-1 rounded bg-white border border-slate-200 hover:bg-slate-100"
+                            title={allCollapsed ? "Mostrar todos los items" : "Colapsar todas las categorias"}
+                          >
+                            {allCollapsed ? "Expandir todo" : "Colapsar todo"}
+                          </button>
+                        )
+                      })()}
+                    </div>
+                  )}
+                </div>
+
+                {/* Menu Items — compact multi-column for "Todo", readable grid for a specific category */}
+                <div className="flex-1 overflow-y-auto p-2">
+                  {selectedMenuCategory === "TODO" ? (
+                    /* TODO view: all categories, compact CSS-columns layout */
+                    <div className="columns-2 lg:columns-3 xl:columns-4 gap-4">
+                      {Object.entries(groupedItems).map(([category, items]) => {
+                        const isCollapsed = collapsedCategories.has(category)
+                        return (
+                        <div key={category} className="break-inside-avoid mb-2">
+                          <div className="flex items-stretch gap-0.5 mb-0.5 bg-slate-100 rounded overflow-hidden">
+                            <button
+                              onClick={() => {
+                                setCollapsedCategories((prev) => {
+                                  const next = new Set(prev)
+                                  if (next.has(category)) next.delete(category)
+                                  else next.add(category)
+                                  return next
+                                })
+                              }}
+                              className="shrink-0 px-1.5 text-slate-600 hover:bg-slate-200 hover:text-slate-900 transition-colors flex items-center justify-center"
+                              title={isCollapsed ? `Expandir ${category}` : `Colapsar ${category}`}
+                              aria-label={isCollapsed ? `Expandir ${category}` : `Colapsar ${category}`}
+                            >
+                              {isCollapsed ? <Plus className="w-3 h-3" /> : <Minus className="w-3 h-3" />}
+                            </button>
+                            <button
+                              onClick={() => setSelectedMenuCategory(category)}
+                              className="flex-1 text-left text-xs font-bold text-slate-600 uppercase tracking-wide px-1 py-0.5 hover:bg-rose-100 hover:text-rose-700 cursor-pointer transition-colors"
+                              title={`Ver solo ${category}`}
+                            >
+                              {category}
+                              {isCollapsed && (
+                                <span className="ml-1 font-normal normal-case text-slate-400">({items.length})</span>
+                              )}
+                            </button>
+                          </div>
+                          {!isCollapsed && (
+                          <div>
+                            {items.map((item) => {
+                              const inCart = cart.filter((c) => c.itemId === item.id)
+                              const totalQty = inCart.reduce((sum, c) => sum + c.quantity, 0)
+                              return (
+                                <button
+                                  key={item.id}
+                                  className="w-full text-left py-px px-1 text-sm hover:bg-rose-50 rounded flex items-center justify-between group"
+                                  onClick={() => openItemDetail(item)}
+                                >
+                                  <span className="truncate text-slate-800 group-hover:text-rose-700 flex-1 mr-2 font-medium">
+                                    {item.name}
+                                  </span>
+                                  <span className="text-slate-700 flex-shrink-0 flex items-center gap-1 font-semibold">
+                                    {totalQty > 0 && (
+                                      <span className="w-4 h-4 bg-rose-500 text-white text-[9px] font-bold rounded-full flex items-center justify-center">
+                                        {totalQty}
+                                      </span>
+                                    )}
+                                    ${Number(item.price).toFixed(2)}
+                                  </span>
+                                </button>
+                              )
+                            })}
+                          </div>
+                          )}
+                        </div>
+                        )
+                      })}
+                    </div>
+                  ) : (
+                    /* Single-category view: configurable 1/2/3-column readable grid */
+                    <div className="max-w-7xl mx-auto">
+                      <h4 className="text-sm font-bold text-slate-700 uppercase tracking-wide mb-3 px-2 py-1.5 bg-slate-100 rounded">
+                        {selectedMenuCategory}
+                      </h4>
+                      <div
+                        className={`grid gap-1.5 ${
+                          menuColumnCount === 1
+                            ? "grid-cols-1"
+                            : menuColumnCount === 2
+                              ? "grid-cols-1 md:grid-cols-2"
+                              : "grid-cols-1 md:grid-cols-2 lg:grid-cols-3"
+                        }`}
+                      >
+                        {(groupedItems[selectedMenuCategory] || []).map((item) => {
+                          const inCart = cart.filter((c) => c.itemId === item.id)
+                          const totalQty = inCart.reduce((sum, c) => sum + c.quantity, 0)
+                          return (
+                            <button
+                              key={item.id}
+                              className="w-full text-left py-2 px-3 text-sm hover:bg-rose-50 rounded-md border border-slate-100 hover:border-rose-200 flex items-center justify-between gap-3 group transition-colors"
+                              onClick={() => openItemDetail(item)}
+                            >
+                              <div className="flex-1 min-w-0">
+                                <p className="text-slate-900 group-hover:text-rose-700 font-medium truncate">
+                                  {item.name}
+                                </p>
+                                {item.description && (
+                                  <p className="text-[11px] text-slate-500 truncate mt-0.5">{item.description}</p>
+                                )}
+                              </div>
+                              <span className="text-slate-800 flex-shrink-0 flex items-center gap-1.5 font-semibold">
+                                {totalQty > 0 && (
+                                  <span className="w-5 h-5 bg-rose-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center">
+                                    {totalQty}
+                                  </span>
+                                )}
+                                ${Number(item.price).toFixed(2)}
+                              </span>
+                            </button>
+                          )
+                        })}
+                      </div>
+                      {(groupedItems[selectedMenuCategory] || []).length === 0 && (
+                        <div className="text-center py-12 text-slate-400">
+                          <p className="text-sm">No hay items en esta categoria</p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </>
+            ) : (
+              /* CATERING MENU */
+              <>
+                {/* Catering Menu Header */}
+                <div className="p-2 border-b border-slate-200 flex items-center gap-2 bg-orange-50">
+                  <h3 className="text-xs font-bold text-orange-800">{selectedCateringRestaurant?.name}</h3>
+                  <span className="text-[9px] bg-orange-200 text-orange-700 px-1.5 py-0.5 rounded">CATERING</span>
+                  <button
+                    onClick={clearSelection}
+                    className="text-[10px] text-slate-500 hover:text-orange-600 ml-auto"
+                  >
+                    Cambiar
+                  </button>
+                </div>
+
+                {/* Catering Menu Items by Category */}
+                <div className="flex-1 overflow-y-auto p-3">
+                  {cateringCategories.length === 0 && menuItems.length === 0 ? (
+                    <div className="text-center py-8 text-slate-400">
+                      <p className="text-sm">No hay items en el menu</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-4">
+                      {cateringCategories.map((category) => {
+                        const categoryItems = menuItems.filter(
+                          (item) => item.catering_category_id === category.id
+                        )
+                        if (categoryItems.length === 0) return null
+                        return (
+                          <div key={category.id} className="mb-4">
+                            <h4 className="text-xs font-bold text-orange-700 uppercase tracking-wide mb-2 px-2 py-1 bg-orange-100 rounded">
+                              {category.name}
+                            </h4>
+                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+                              {categoryItems.map((item) => {
+                                const inCart = cart.filter((c) => c.itemId === `catering-${item.id}`)
+                                const totalQty = inCart.reduce((sum, c) => sum + c.quantity, 0)
+                                return (
+                                  <div
+                                    key={item.id}
+                                    className="bg-white border border-slate-200 rounded-lg p-2 hover:border-orange-300 hover:shadow-sm transition-all cursor-pointer"
+                                    onClick={() => {
+                                      // Add catering item to cart
+                                      const cartItem: CartItem = {
+                                        id: `catering-${item.id}-${Date.now()}`,
+                                        itemId: `catering-${item.id}`,
+                                        name: item.name,
+                                        price: Number(item.price),
+                                        quantity: item.min_quantity || 1,
+                                        description: item.description || "",
+                                        selectedOptions: {},
+                                        notes: "",
+                                        sizeName: item.selling_unit || undefined,
+                                        sizeServes: item.serves ? String(item.serves) : undefined,
+                                      }
+                                      setCart((prev) => [...prev, cartItem])
+                                      setIsCartOpen(true)
+                                    }}
+                                  >
+                                    <div className="flex gap-2">
+                                      {item.image_url && (
+                                        <img
+                                          src={item.image_url}
+                                          alt={item.name}
+                                          className="w-12 h-12 object-cover rounded flex-shrink-0"
+                                        />
+                                      )}
+                                      <div className="flex-1 min-w-0">
+                                        <div className="flex items-start justify-between gap-1">
+                                          <p className="text-xs font-medium text-slate-800 truncate">{item.name}</p>
+                                          {totalQty > 0 && (
+                                            <span className="w-5 h-5 bg-orange-500 text-white text-[9px] font-bold rounded-full flex items-center justify-center flex-shrink-0">
+                                              {totalQty}
+                                            </span>
+                                          )}
+                                        </div>
+                                        <div className="flex items-center gap-2 mt-0.5">
+                                          <span className="text-xs font-bold text-orange-600">
+                                            ${Number(item.price).toFixed(2)}
+                                          </span>
+                                          {item.selling_unit && (
+                                            <span className="text-[9px] text-slate-500">/ {item.selling_unit}</span>
+                                          )}
+                                        </div>
+                                        <div className="flex items-center gap-2 mt-0.5 text-[9px] text-slate-500">
+                                          {item.serves && <span>Sirve {item.serves}</span>}
+                                          {item.min_quantity && item.min_quantity > 1 && (
+                                            <span className="text-amber-600">Min. {item.min_quantity}</span>
+                                          )}
+                                        </div>
+                                      </div>
+                                    </div>
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          </div>
+                        )
+                      })}
+                      {/* Items without category */}
+                      {(() => {
+                        const uncategorizedItems = menuItems.filter(
+                          (item) => !item.catering_category_id || !cateringCategories.find((c) => c.id === item.catering_category_id)
+                        )
+                        if (uncategorizedItems.length === 0) return null
+                        return (
+                          <div className="mb-4">
+                            <h4 className="text-xs font-bold text-slate-600 uppercase tracking-wide mb-2 px-2 py-1 bg-slate-100 rounded">
+                              Otros
+                            </h4>
+                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+                              {uncategorizedItems.map((item) => {
+                                const inCart = cart.filter((c) => c.itemId === `catering-${item.id}`)
+                                const totalQty = inCart.reduce((sum, c) => sum + c.quantity, 0)
+                                return (
+                                  <div
+                                    key={item.id}
+                                    className="bg-white border border-slate-200 rounded-lg p-2 hover:border-orange-300 hover:shadow-sm transition-all cursor-pointer"
+                                    onClick={() => {
+                                      const cartItem: CartItem = {
+                                        id: `catering-${item.id}-${Date.now()}`,
+                                        itemId: `catering-${item.id}`,
+                                        name: item.name,
+                                        price: Number(item.price),
+                                        quantity: item.min_quantity || 1,
+                                        description: item.description || "",
+                                        selectedOptions: {},
+                                        notes: "",
+                                        sizeName: item.selling_unit || undefined,
+                                        sizeServes: item.serves ? String(item.serves) : undefined,
+                                      }
+                                      setCart((prev) => [...prev, cartItem])
+                                      setIsCartOpen(true)
+                                    }}
+                                  >
+                                    <div className="flex gap-2">
+                                      {item.image_url && (
+                                        <img
+                                          src={item.image_url}
+                                          alt={item.name}
+                                          className="w-12 h-12 object-cover rounded flex-shrink-0"
+                                        />
+                                      )}
+                                      <div className="flex-1 min-w-0">
+                                        <div className="flex items-start justify-between gap-1">
+                                          <p className="text-xs font-medium text-slate-800 truncate">{item.name}</p>
+                                          {totalQty > 0 && (
+                                            <span className="w-5 h-5 bg-orange-500 text-white text-[9px] font-bold rounded-full flex items-center justify-center flex-shrink-0">
+                                              {totalQty}
+                                            </span>
+                                          )}
+                                        </div>
+                                        <div className="flex items-center gap-2 mt-0.5">
+                                          <span className="text-xs font-bold text-orange-600">
+                                            ${Number(item.price).toFixed(2)}
+                                          </span>
+                                          {item.selling_unit && (
+                                            <span className="text-[9px] text-slate-500">/ {item.selling_unit}</span>
+                                          )}
+                                        </div>
+                                        <div className="flex items-center gap-2 mt-0.5 text-[9px] text-slate-500">
+                                          {item.serves && <span>Sirve {item.serves}</span>}
+                                          {item.min_quantity && item.min_quantity > 1 && (
+                                            <span className="text-amber-600">Min. {item.min_quantity}</span>
+                                          )}
+                                        </div>
+                                      </div>
+                                    </div>
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          </div>
+                        )
+                      })()}
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+          
+          
+        </div>
+
+        {/* RIGHT SLIDEOUT: Shopping Cart */}
+        <div className={`bg-white border-l border-slate-200 transition-all duration-300 overflow-hidden flex-shrink-0 ${
+          isCartOpen ? "w-72" : "w-0"
+        }`}>
+          <div className="w-72 h-full flex flex-col">
+            <div className="p-2 border-b border-slate-200 flex items-center justify-between bg-rose-50">
+              <div className="flex items-center gap-1.5">
+                <ShoppingCart className="w-4 h-4 text-rose-500" />
+                <span className="text-xs font-bold text-rose-700">Carrito ({totalItems})</span>
+              </div>
+              <button onClick={() => setIsCartOpen(false)} className="p-1 hover:bg-rose-100 rounded">
+                <X className="w-4 h-4 text-rose-500" />
+              </button>
+            </div>
+            
+            <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
+              {cart.length === 0 ? (
+                <div className="text-center py-8 text-slate-400">
+                  <ShoppingCart className="w-8 h-8 mx-auto mb-2 opacity-30" />
+                  <p className="text-xs">Carrito vacio</p>
+                </div>
+              ) : (
+                cart.map((item) => (
+                  <div key={item.id} className={`rounded p-2 ${item.isInternalShop ? 'bg-purple-50 border border-purple-200' : 'bg-slate-50'}`}>
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex-1 min-w-0">
+                        {item.isInternalShop && (
+                          <span className="text-[8px] bg-purple-200 text-purple-700 px-1 py-0.5 rounded mb-0.5 inline-block">
+                            TIENDA INTERNA
+                          </span>
+                        )}
+                        <p className={`text-xs font-medium truncate ${item.isInternalShop ? 'text-purple-900' : 'text-slate-900'}`}>{item.name.replace('[Tienda] ', '')}</p>
+                        {item.selectedOptions && Object.keys(item.selectedOptions).length > 0 && (
+                          <div className="mt-0.5">
+                            {Object.entries(item.selectedOptions).map(([cat, val]) => (
+                              <p key={cat} className="text-[10px] text-blue-600 italic truncate">
+                                {val}
+                              </p>
+                            ))}
+                          </div>
+                        )}
+                        {item.notes && (
+                          <p className="text-[10px] text-amber-600 mt-0.5 truncate" title={item.notes}>
+                            Nota: {item.notes}
+                          </p>
+                        )}
+                        <p className="text-[10px] text-slate-500 mt-0.5">${item.price.toFixed(2)}</p>
+                      </div>
+                      <button
+                        onClick={() => removeFromCart(item.id)}
+                        className="p-1 text-slate-400 hover:text-red-500"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    </div>
+                    <div className="flex items-center justify-between mt-1.5">
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={() => updateQuantity(item.id, -1)}
+                          className="w-5 h-5 rounded bg-white border border-slate-200 flex items-center justify-center hover:bg-slate-100"
+                        >
+                          <Minus className="w-3 h-3" />
+                        </button>
+                        <span className="w-6 text-center text-xs font-medium">{item.quantity}</span>
+                        <button
+                          onClick={() => updateQuantity(item.id, 1)}
+                          className="w-5 h-5 rounded bg-white border border-slate-200 flex items-center justify-center hover:bg-slate-100"
+                        >
+                          <Plus className="w-3 h-3" />
+                        </button>
+                      </div>
+                      <span className="text-xs font-bold text-slate-900">
+                        ${(item.price * item.quantity).toFixed(2)}
+                      </span>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {cart.length > 0 && (() => {
+              // For catering orders, use dynamic dispatch fee from restaurant config
+              // For online ordering, use fixed dispatch fee
+              const orderTypeForDispatch = customerInfo.deliveryType === "delivery" ? "entrega" : "recogido"
+              const deliveryFee = customerInfo.deliveryType === "delivery" ? DELIVERY_FEE : 0
+              const dispatchFee = activeTent === "catering" && selectedCateringRestaurant
+                ? calculateDispatchFee(selectedCateringRestaurant, orderTypeForDispatch, subtotal)
+                : (customerInfo.deliveryType === "delivery" ? DISPATCH_FEE : 0)
+              const ivu = subtotal * IVU_RATE
+              const tipAmount = customTip ? parseFloat(customTip) || 0 : (subtotal * tipPercentage / 100)
+              const total = subtotal + deliveryFee + dispatchFee + ivu + tipAmount
+              
+              return (
+                <div className="p-3 border-t border-slate-200 bg-white">
+                  {/* Header */}
+                  <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wide mb-2">DETALLES DE LA ORDEN</p>
+                  
+                  {/* Subtotal */}
+                  <div className="flex justify-between text-xs mb-1">
+                    <span className="text-slate-900 font-medium">Subtotal</span>
+                    <span className="text-slate-900">${subtotal.toFixed(2)}</span>
+                  </div>
+                  
+                  {/* Delivery Fee */}
+                  {customerInfo.deliveryType === "delivery" && (
+                    <>
+                      <div className="flex justify-between text-xs mb-1">
+                        <span className="text-rose-500">
+                          Delivery{deliveryDistance > 0 ? ` (${deliveryDistance.toFixed(1)} mi)` : ""}
+                          {isCalculatingFee && <span className="ml-1 text-slate-400">...</span>}
+                        </span>
+                        <span className="text-slate-900">${deliveryFee.toFixed(2)}</span>
+                      </div>
+                      {dispatchFee > 0 && (
+                        <div className="flex justify-between text-xs mb-1">
+                          <span className="text-rose-500">
+                            Dispatch Fee
+                          </span>
+                          <span className="text-slate-900">${dispatchFee.toFixed(2)}</span>
+                        </div>
+                      )}
+                    </>
+                  )}
+
+                  {/* Dispatch Fee for Catering Pickup */}
+                  {activeTent === "catering" && customerInfo.deliveryType === "pickup" && dispatchFee > 0 && (
+                    <div className="flex justify-between text-xs mb-1">
+                      <span className="text-rose-500">Dispatch Fee</span>
+                      <span className="text-slate-900">${dispatchFee.toFixed(2)}</span>
+                    </div>
+                  )}
+                  
+                  {/* IVU */}
+                  <div className="flex justify-between text-xs mb-2">
+                    <span className="text-rose-500">IVU</span>
+                    <span className="text-slate-900">${ivu.toFixed(2)}</span>
+                  </div>
+                  
+                  {/* Tip Section */}
+                  <div className="border-t border-slate-100 pt-2 mb-2">
+                    <div className="flex justify-between items-center mb-1.5">
+                      <span className="text-xs text-slate-900 font-medium">Propina</span>
+                      <span className="text-xs text-slate-900">${tipAmount.toFixed(2)}</span>
+                    </div>
+                    <div className="flex gap-1">
+                      {[10, 15, 18, 20].map((pct) => (
+                        <button
+                          key={pct}
+                          onClick={() => { setTipPercentage(pct); setCustomTip(""); }}
+                          className={`flex-1 py-1.5 text-[11px] rounded-full transition-colors ${
+                            tipPercentage === pct && !customTip
+                              ? "bg-amber-400 text-slate-900 font-medium"
+                              : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                          }`}
+                        >
+                          {pct}%
+                        </button>
+                      ))}
+                      <button
+                        onClick={() => {
+                          const amount = window.prompt("Ingrese monto de propina:")
+                          if (amount) setCustomTip(amount)
+                        }}
+                        className={`flex-1 py-1.5 text-[11px] rounded-full transition-colors ${
+                          customTip
+                            ? "bg-amber-400 text-slate-900 font-medium"
+                            : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                        }`}
+                      >
+                        Otro
+                      </button>
+                    </div>
+                  </div>
+                  
+                  {/* Total */}
+                  <div className="flex justify-between pt-2 border-t border-slate-200">
+                    <span className="text-sm font-bold text-slate-900">Total</span>
+                    <span className="text-sm font-bold text-rose-600">${total.toFixed(2)}</span>
+                  </div>
+                  
+                  
+                  {orderSuccess && (
+                    <div className="mt-2 p-2 bg-green-100 border border-green-300 rounded text-center">
+                      <p className="text-xs font-medium text-green-700">Orden Creada</p>
+                      <p className="text-[10px] text-green-600">{orderSuccess}</p>
+                    </div>
+                  )}
+                </div>
+              )
+            })()}
+          </div>
+        </div>
+      </div>
+
+      {/* Payment Modal */}
+      {showPaymentModal && selectedRestaurant && cart.length > 0 && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-lg w-full max-w-lg max-h-[90vh] overflow-y-auto">
+            {paymentMethod === "stripe" ? (
+              <StripeCheckout
+                orderData={{
+                  restaurantId: selectedRestaurant.id,
+                  restaurantName: selectedRestaurant.name,
+                  restaurantAddress: selectedRestaurant.address || "",
+                  branchId: null, // Not using branches - each restaurant is a unit
+                  branchName: null,
+                  customerId: selectedCustomerId, // Link to existing customer if selected
+                  paymentProvider: "stripe_athmovil",
+                  stripeAccountId: (() => {
+                    const track = (selectedRestaurant as any).payment_track ?? 'portal'
+                    if (track === 'connected') {
+                      if (!(selectedRestaurant as any).stripe_account_id) {
+                        throw new Error(`Restaurant ${selectedRestaurant.name} is connected track but has no stripe_account_id`)
+                      }
+                      return (selectedRestaurant as any).stripe_account_id
+                    }
+                    return null
+                  })(),
+                  athmovilPublicToken: selectedRestaurant.athmovil_public_token || null,
+                  athmovilEcommerceId: selectedRestaurant.athmovil_ecommerce_id || null,
+                  cart: cart.map(item => ({
+                    id: item.itemId,
+                    name: item.name,
+                    price: item.price,
+                    quantity: item.quantity,
+                    totalPrice: item.price * item.quantity,
+                    selectedOptions: item.selectedOptions || {},
+                    selectedAddons: [],
+                    notes: item.notes,
+                    is_internal_shop: false,
+                  })),
+                  subtotal: subtotal,
+                  tax: subtotal * IVU_RATE,
+                  deliveryFee: customerInfo.deliveryType === "delivery" ? DELIVERY_FEE : 0,
+                  dispatchFee: customerInfo.deliveryType === "delivery" ? DISPATCH_FEE : 0,
+                  tip: customTip ? parseFloat(customTip) || 0 : (subtotal * tipPercentage / 100),
+                  total: (() => {
+                    const deliveryFee = customerInfo.deliveryType === "delivery" ? DELIVERY_FEE : 0
+                    const dispatchFee = customerInfo.deliveryType === "delivery" ? DISPATCH_FEE : 0
+                    const ivu = subtotal * IVU_RATE
+                    const tipAmount = customTip ? parseFloat(customTip) || 0 : (subtotal * tipPercentage / 100)
+                    return subtotal + deliveryFee + dispatchFee + ivu + tipAmount
+                  })(),
+                  orderType: customerInfo.deliveryType,
+                  eventDetails: {
+                    name: customerInfo.name,
+                    email: customerInfo.email,
+                    phone: customerInfo.phone,
+                    company: "",
+                    eventDate: customerInfo.eventDate,
+                    eventTime: customerInfo.eventTime,
+                    address: customerInfo.streetAddress,
+                    address2: customerInfo.streetAddress2,
+                    city: customerInfo.city,
+                    state: customerInfo.state,
+                    zip: customerInfo.zip,
+                    specialInstructions: customerInfo.specialInstructions,
+                    // Rooftop coords captured from autocomplete / pin drag /
+                    // Ubicarme. Flow to Shipday via the order create path so
+                    // the driver doesn't have to re-geocode on the phone.
+                    deliveryLatitude: customerInfo.latitude,
+                    deliveryLongitude: customerInfo.longitude,
+                  },
+                  customerEmail: customerInfo.email,
+                  customerPhone: customerInfo.phone,
+                  smsConsent: true,
+                  includeUtensils: false,
+                  deliveryZone: deliveryDistance > 0 ? `Tier (${deliveryDistance.toFixed(1)} mi)` : undefined,
+                  deliveryDistance: deliveryDistance > 0 ? deliveryDistance : undefined,
+                  order_source: "csr",
+                }}
+                onSuccess={() => {
+                  setShowPaymentModal(false)
+                  setOrderSuccess("Pago completado exitosamente")
+                  setCart([])
+                  setCustomerInfo({
+                    phone: "",
+                    name: "",
+                    email: "",
+                    streetAddress: "",
+                    streetAddress2: "",
+                    city: "",
+                    state: "PR",
+                    zip: "",
+                    deliveryType: "delivery",
+                    eventDate: getDefaultDateTime("delivery").date,
+                    eventTime: getDefaultDateTime("delivery").time,
+                    specialInstructions: "",
+                    selectedBranch: "",
+                    guestCount: "",
+                    latitude: null,
+                    longitude: null,
+                  })
+                  setAddressConfidence("high")
+                  setPinConfirmed(false)
+                  setSelectedCustomerId(null)
+                  setTimeout(() => setOrderSuccess(null), 5000)
+                }}
+                onCancel={() => setShowPaymentModal(false)}
+              />
+            ) : (
+              <ATHMovilCheckout
+                orderData={{
+                  restaurantId: selectedRestaurant.id,
+                  restaurantName: selectedRestaurant.name,
+                  restaurantAddress: selectedRestaurant.address || "",
+                  branchId: null, // Not using branches - each restaurant is a unit
+                  branchName: null,
+                  customerId: selectedCustomerId,
+                  paymentProvider: "stripe_athmovil",
+                  athmovilPublicToken: selectedRestaurant.athmovil_public_token,
+                  athmovilEcommerceId: selectedRestaurant.athmovil_ecommerce_id,
+                  cart: cart.map(item => ({
+                    id: item.itemId,
+                    menu_item_id: item.itemId,
+                    name: item.name,
+                    price: item.price,
+                    quantity: item.quantity,
+                    totalPrice: item.price * item.quantity,
+                    selectedOptions: item.selectedOptions || {},
+                    selectedAddons: [],
+                    is_internal_shop: false,
+                  })),
+                  subtotal: subtotal,
+                  tax: subtotal * IVU_RATE,
+                  deliveryFee: customerInfo.deliveryType === "delivery" ? DELIVERY_FEE : 0,
+                  dispatchFee: customerInfo.deliveryType === "delivery" ? DISPATCH_FEE : 0,
+                  tip: customTip ? parseFloat(customTip) || 0 : (subtotal * tipPercentage / 100),
+                  total: (() => {
+                    const deliveryFee = customerInfo.deliveryType === "delivery" ? DELIVERY_FEE : 0
+                    const dispatchFee = customerInfo.deliveryType === "delivery" ? DISPATCH_FEE : 0
+                    const ivu = subtotal * IVU_RATE
+                    const tipAmount = customTip ? parseFloat(customTip) || 0 : (subtotal * tipPercentage / 100)
+                    return subtotal + deliveryFee + dispatchFee + ivu + tipAmount
+                  })(),
+                  orderType: customerInfo.deliveryType,
+                  customerEmail: customerInfo.email,
+                  customerPhone: customerInfo.phone,
+                  smsConsent: true,
+                  eventDetails: {
+                    name: customerInfo.name,
+                    email: customerInfo.email,
+                    phone: customerInfo.phone,
+                    company: "",
+                    eventDate: customerInfo.eventDate,
+                    eventTime: customerInfo.eventTime,
+                    address: customerInfo.streetAddress,
+                    address2: customerInfo.streetAddress2,
+                    city: customerInfo.city,
+                    state: customerInfo.state,
+                    zip: customerInfo.zip,
+                    specialInstructions: customerInfo.specialInstructions,
+                    deliveryLatitude: customerInfo.latitude,
+                    deliveryLongitude: customerInfo.longitude,
+                  },
+                  includeUtensils: false,
+                  deliveryZone: deliveryDistance > 0 ? `Tier (${deliveryDistance.toFixed(1)} mi)` : undefined,
+                  deliveryDistance: deliveryDistance > 0 ? deliveryDistance : undefined,
+                  order_source: "csr",
+                }}
+                onSuccess={() => {
+                  setShowPaymentModal(false)
+                  setOrderSuccess("Pago ATH Movil completado")
+                  setCart([])
+                  setCustomerInfo({
+                    phone: "",
+                    name: "",
+                    email: "",
+                    streetAddress: "",
+                    streetAddress2: "",
+                    city: "",
+                    state: "PR",
+                    zip: "",
+                    deliveryType: "delivery",
+                    eventDate: getDefaultDateTime("delivery").date,
+                    eventTime: getDefaultDateTime("delivery").time,
+                    specialInstructions: "",
+                    selectedBranch: "",
+                    guestCount: "",
+                    latitude: null,
+                    longitude: null,
+                  })
+                  setAddressConfidence("high")
+                  setPinConfirmed(false)
+                  setSelectedCustomerId(null)
+                  setTimeout(() => setOrderSuccess(null), 5000)
+                }}
+                onCancel={() => setShowPaymentModal(false)}
+              />
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Read-back Confirmation Modal */}
+      {showReadbackModal && selectedRestaurant && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-lg w-full max-w-lg max-h-[90vh] overflow-hidden flex flex-col">
+            <div className="p-4 border-b border-slate-200 bg-amber-50 flex items-center justify-between">
+              <div>
+                <h3 className="font-bold text-amber-800">Confirmar Orden</h3>
+                <p className="text-xs text-amber-600">Lea al cliente para confirmar</p>
+              </div>
+              <button
+                onClick={() => setShowReadbackModal(false)}
+                className="p-1 hover:bg-amber-200 rounded"
+              >
+                <X className="w-4 h-4 text-amber-600" />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+              {/* Customer Info */}
+              <div className="bg-slate-50 rounded-lg p-3">
+                <h4 className="text-xs font-semibold text-slate-700 mb-2">Cliente</h4>
+                <div className="text-sm space-y-1">
+                  <p><span className="text-slate-500">Nombre:</span> <strong>{customerInfo.name}</strong></p>
+                  <p><span className="text-slate-500">Telefono:</span> <strong>{customerInfo.phone}</strong></p>
+                  {customerInfo.email && <p><span className="text-slate-500">Email:</span> {customerInfo.email}</p>}
+                </div>
+              </div>
+
+              {/* Delivery Info */}
+              <div className="bg-slate-50 rounded-lg p-3">
+                <h4 className="text-xs font-semibold text-slate-700 mb-2">
+                  {customerInfo.deliveryType === "delivery" ? "Delivery" : "Pickup"}
+                </h4>
+                <div className="text-sm space-y-1">
+                  <p><span className="text-slate-500">Restaurante:</span> <strong>{selectedRestaurant.name}</strong></p>
+                  {customerInfo.deliveryType === "delivery" && (
+                    <>
+                      <p><span className="text-slate-500">Direccion:</span> <strong>{customerInfo.streetAddress}{customerInfo.streetAddress2 ? `, ${customerInfo.streetAddress2}` : ""}, {customerInfo.city}, {customerInfo.state} {customerInfo.zip}</strong></p>
+                    </>
+                  )}
+                  <p><span className="text-slate-500">Fecha:</span> <strong>{customerInfo.eventDate}</strong> a las <strong>{customerInfo.eventTime}</strong></p>
+                  {customerInfo.specialInstructions && (
+                    <p><span className="text-slate-500">Notas:</span> {customerInfo.specialInstructions}</p>
+                  )}
+                </div>
+              </div>
+
+              {/* Order Items */}
+              <div className="bg-slate-50 rounded-lg p-3">
+                <h4 className="text-xs font-semibold text-slate-700 mb-2">Items ({totalItems})</h4>
+                <div className="space-y-2">
+                  {cart.map((item) => (
+                    <div key={item.id} className="flex justify-between text-sm">
+                      <span>
+                        <strong>{item.quantity}x</strong> {item.name}
+                        {item.selectedOptions && Object.keys(item.selectedOptions).length > 0 && (
+                          <span className="text-slate-400 text-xs ml-1">
+                            ({Object.values(item.selectedOptions).filter(v => v).join(", ")})
+                          </span>
+                        )}
+                      </span>
+                      <span className="font-medium">${(item.price * item.quantity).toFixed(2)}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Totals */}
+              <div className="bg-amber-50 rounded-lg p-3 border border-amber-200">
+                <div className="space-y-1 text-sm">
+                  <div className="flex justify-between">
+                    <span>Subtotal:</span>
+                    <span>${subtotal.toFixed(2)}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>IVU (11.5%):</span>
+                    <span>${(subtotal * IVU_RATE).toFixed(2)}</span>
+                  </div>
+                  {customerInfo.deliveryType === "delivery" && (
+                    <>
+                      <div className="flex justify-between">
+                        <span>Delivery:</span>
+                        <span>${DELIVERY_FEE.toFixed(2)}</span>
+                      </div>
+                      {DISPATCH_FEE > 0 && (
+                        <div className="flex justify-between">
+                          <span>Dispatch Fee:</span>
+                          <span>${DISPATCH_FEE.toFixed(2)}</span>
+                        </div>
+                      )}
+                    </>
+                  )}
+                  {(customTip || tipPercentage > 0) && (
+                    <div className="flex justify-between">
+                      <span>Propina:</span>
+                      <span>${(customTip ? parseFloat(customTip) || 0 : (subtotal * tipPercentage / 100)).toFixed(2)}</span>
+                    </div>
+                  )}
+                  <div className="flex justify-between font-bold text-lg pt-1 border-t border-amber-300">
+                    <span>Total:</span>
+                    <span>${(() => {
+                      const deliveryFee = customerInfo.deliveryType === "delivery" ? DELIVERY_FEE : 0
+                      const dispatchFee = customerInfo.deliveryType === "delivery" ? DISPATCH_FEE : 0
+                      const ivu = subtotal * IVU_RATE
+                      const tipAmount = customTip ? parseFloat(customTip) || 0 : (subtotal * tipPercentage / 100)
+                      return (subtotal + deliveryFee + dispatchFee + ivu + tipAmount).toFixed(2)
+                    })()}</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Payment Method */}
+              <div className="bg-slate-50 rounded-lg p-3">
+                <h4 className="text-xs font-semibold text-slate-700 mb-1">Metodo de Pago</h4>
+                <p className="text-sm font-medium">
+                  {paymentMethod === "cash" && "Efectivo (Pago al recibir)"}
+                  {paymentMethod === "saved_card" && customerPaymentMethods.find(pm => pm.id === selectedPaymentMethodId) && (
+                    <>Tarjeta guardada: {customerPaymentMethods.find(pm => pm.id === selectedPaymentMethodId)?.card_brand?.toUpperCase()} ••���• {customerPaymentMethods.find(pm => pm.id === selectedPaymentMethodId)?.card_last_four}</>
+                  )}
+                  {paymentMethod === "stripe" && "Tarjeta de credito"}
+                  {paymentMethod === "ath_movil" && "ATH Movil"}
+                </p>
+              </div>
+            </div>
+
+            {/* Actions */}
+            <div className="p-4 border-t border-slate-200 bg-slate-50 flex gap-2">
+              <button
+                onClick={() => setShowReadbackModal(false)}
+                className="flex-1 px-4 py-2 border border-slate-300 rounded-lg text-slate-700 hover:bg-slate-100 transition-colors text-sm"
+              >
+                Editar Orden
+              </button>
+              <button
+                onClick={async () => {
+                  // Save new customer if needed
+                  let customerId = selectedCustomerId
+                  if (!customerId && customerInfo.name && customerInfo.phone) {
+                    customerId = await saveNewCustomer()
+                  }
+                  
+                  if (paymentMethod === "cash") {
+                    // Process cash order with retry logic
+                    const processCashOrder = async (retryCount = 0): Promise<boolean> => {
+                      try {
+                        // Validate locally first
+                        if (!selectedRestaurant?.id) {
+                          alert("Error: Restaurante no seleccionado")
+                          return false
+                        }
+                        if (cart.length === 0) {
+                          alert("Error: El carrito está vacío")
+                          return false
+                        }
+                        if (!customerInfo.name?.trim()) {
+                          alert("Error: Nombre del cliente requerido")
+                          return false
+                        }
+                        if (!customerInfo.phone?.trim()) {
+                          alert("Error: Teléfono del cliente requerido")
+                          return false
+                        }
+                        if (!emailValid) {
+                          alert("Error: Email del cliente requerido (se usa para vincular la orden al cliente)")
+                          return false
+                        }
+                        if (customerInfo.deliveryType === "delivery" && !customerInfo.streetAddress?.trim()) {
+                          alert("Error: Dirección de entrega requerida")
+                          return false
+                        }
+
+                        const deliveryFee = customerInfo.deliveryType === "delivery" ? DELIVERY_FEE : 0
+                        const dispatchFee = customerInfo.deliveryType === "delivery" ? DISPATCH_FEE : 0
+                        const ivu = subtotal * IVU_RATE
+                        const tipAmount = customTip ? parseFloat(customTip) || 0 : (subtotal * tipPercentage / 100)
+                        const total = subtotal + deliveryFee + dispatchFee + ivu + tipAmount
+
+                        // Create AbortController for timeout
+                        const controller = new AbortController()
+                        const timeoutId = setTimeout(() => controller.abort(), 30000) // 30 second timeout
+
+                        const response = await fetch("/api/csr/process-cash-order", {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({
+                            restaurantId: selectedRestaurant.id,
+                            branchId: customerInfo.selectedBranch || null,
+                            customerId,
+                            cart: cart.map(item => ({
+                              id: item.itemId,
+                              name: item.name,
+                              price: item.price,
+                              quantity: item.quantity,
+                              selectedOptions: item.selectedOptions,
+                            })),
+                            subtotal,
+                            tax: ivu,
+                            deliveryFee,
+                            dispatchFee,
+                            tip: tipAmount,
+                            total,
+                            orderType: customerInfo.deliveryType,
+                            eventDetails: {
+                              name: customerInfo.name.trim(),
+                              email: customerInfo.email?.trim() || null,
+                              phone: customerInfo.phone.trim(),
+                              eventDate: customerInfo.eventDate,
+                              eventTime: customerInfo.eventTime,
+                              address: customerInfo.streetAddress?.trim() || null,
+                              apt: customerInfo.streetAddress2?.trim() || null,
+                              city: customerInfo.city?.trim() || null,
+                              state: "PR",
+                              zip: customerInfo.zip?.trim() || null,
+                              specialInstructions: customerInfo.specialInstructions?.trim() || null,
+                              deliveryLatitude: customerInfo.latitude,
+                              deliveryLongitude: customerInfo.longitude,
+                            },
+                          }),
+                          signal: controller.signal,
+                        })
+
+                        clearTimeout(timeoutId)
+
+                        // Handle non-OK responses
+                        if (!response.ok) {
+                          let errorMsg = `Error del servidor: ${response.status}`
+                          try {
+                            const errorData = await response.json()
+                            if (errorData.error) errorMsg = errorData.error
+                          } catch {
+                            // If JSON parse fails, use status code message
+                          }
+                          throw new Error(errorMsg)
+                        }
+
+                        const result = await response.json()
+                        
+                        if (result.success) {
+                          setShowReadbackModal(false)
+                          setOrderSuccess(`Orden #${result.orderNumber} creada - Pago en efectivo`)
+                          setCart([])
+                          setCustomerInfo({
+                            phone: "",
+                            name: "",
+                            email: "",
+                            streetAddress: "",
+                            streetAddress2: "",
+                            city: "",
+                            state: "PR",
+                            zip: "",
+                            deliveryType: "delivery",
+                            eventDate: getDefaultDateTime("delivery").date,
+                            eventTime: getDefaultDateTime("delivery").time,
+                            specialInstructions: "",
+                            selectedBranch: "",
+                            guestCount: "",
+                            latitude: null,
+                            longitude: null,
+                          })
+                          setAddressConfidence("high")
+                          setPinConfirmed(false)
+                          setSelectedCustomerId(null)
+                          setCustomerPaymentMethods([])
+                          setTimeout(() => setOrderSuccess(null), 5000)
+                          return true
+                        } else {
+                          throw new Error(result.error || "Error desconocido")
+                        }
+                      } catch (error: any) {
+                        console.error("Cash order error:", error)
+                        
+                        // Handle timeout/abort
+                        if (error.name === "AbortError") {
+                          if (retryCount < 2) {
+                            const shouldRetry = confirm("La solicitud tardó demasiado. ¿Desea intentar de nuevo?")
+                            if (shouldRetry) {
+                              return processCashOrder(retryCount + 1)
+                            }
+                          } else {
+                            alert("Error: Tiempo de espera agotado. Por favor intente más tarde.")
+                          }
+                          return false
+                        }
+                        
+                        // Handle network errors with retry
+                        if (error.message?.includes("fetch") || error.message?.includes("network")) {
+                          if (retryCount < 2) {
+                            const shouldRetry = confirm("Error de conexión. ¿Desea intentar de nuevo?")
+                            if (shouldRetry) {
+                              return processCashOrder(retryCount + 1)
+                            }
+                          }
+                          return false
+                        }
+                        
+                        // Show specific error message from server
+                        alert(`Error: ${error.message || "Error procesando orden"}`)
+                        return false
+                      }
+                    }
+                    
+                    await processCashOrder()
+                  } else if (paymentMethod === "saved_card" && selectedPaymentMethodId) {
+                    // Process saved card payment
+                    try {
+                      const pm = customerPaymentMethods.find(p => p.id === selectedPaymentMethodId)
+                      if (!pm) {
+                        alert("No se encontro el metodo de pago")
+                        return
+                      }
+                      
+                      const deliveryFee = customerInfo.deliveryType === "delivery" ? DELIVERY_FEE + DISPATCH_FEE : 0
+                      const ivu = subtotal * IVU_RATE
+                      const tipAmount = customTip ? parseFloat(customTip) || 0 : (subtotal * tipPercentage / 100)
+                      const total = subtotal + deliveryFee + ivu + tipAmount
+                      
+                      const response = await fetch("/api/csr/process-saved-card", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                          restaurantId: selectedRestaurant.id,
+                          customerId,
+                          stripeCustomerId: pm.provider_customer_id,
+                          paymentMethodId: pm.provider_payment_method_id,
+                          stripeAccountId: (() => {
+                            const track = (selectedRestaurant as any).payment_track ?? 'portal'
+                            if (track === 'connected') {
+                              if (!(selectedRestaurant as any).stripe_account_id) {
+                                throw new Error(`Restaurant ${selectedRestaurant.name} is connected track but has no stripe_account_id`)
+                              }
+                              return (selectedRestaurant as any).stripe_account_id
+                            }
+                            return null
+                          })(),
+                          cart: cart.map(item => ({
+                            id: item.itemId,
+                            name: item.name,
+                            price: item.price,
+                            quantity: item.quantity,
+                            selectedOptions: item.selectedOptions,
+                          })),
+                          subtotal,
+                          tax: ivu,
+                          deliveryFee,
+                          tip: tipAmount,
+                          total,
+                          orderType: customerInfo.deliveryType,
+                          eventDetails: {
+                            name: customerInfo.name,
+                            email: customerInfo.email,
+                            phone: customerInfo.phone,
+                            eventDate: customerInfo.eventDate,
+                            eventTime: customerInfo.eventTime,
+                            address: customerInfo.streetAddress,
+                            city: customerInfo.city,
+                            state: "PR",
+                            zip: customerInfo.zip,
+                            specialInstructions: customerInfo.specialInstructions,
+                          },
+                        }),
+                      })
+                      
+                      const result = await response.json()
+                      if (result.success) {
+                        setShowReadbackModal(false)
+                        setOrderSuccess(`Orden #${result.orderNumber} completada`)
+                        setCart([])
+                        setCustomerInfo({
+                          phone: "",
+                          name: "",
+                          email: "",
+                          streetAddress: "",
+                          streetAddress2: "",
+                          city: "",
+                          state: "PR",
+                          zip: "",
+                          deliveryType: "delivery",
+                          eventDate: getDefaultDateTime("delivery").date,
+                          eventTime: getDefaultDateTime("delivery").time,
+                          specialInstructions: "",
+                          selectedBranch: "",
+                          guestCount: "",
+                          latitude: null,
+                          longitude: null,
+                        })
+                        setAddressConfidence("high")
+                        setPinConfirmed(false)
+                        setSelectedCustomerId(null)
+                        setCustomerPaymentMethods([])
+                        setTimeout(() => setOrderSuccess(null), 5000)
+                      } else {
+                        alert("Error: " + result.error)
+                      }
+                    } catch (error) {
+                      console.error("Saved card error:", error)
+                      alert("Error procesando pago")
+                    }
+                  } else {
+                    // For Stripe/ATH, close read-back and open payment modal
+                    setShowReadbackModal(false)
+                    setShowPaymentModal(true)
+                  }
+                }}
+                className="flex-1 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors text-sm font-medium"
+              >
+                {paymentMethod === "cash" ? "Confirmar Orden (Efectivo)" : 
+                 paymentMethod === "saved_card" ? "Cobrar Tarjeta Guardada" :
+                 "Proceder al Pago"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Item Options Modal */}
+      {selectedItem && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-lg w-full max-w-md max-h-[80vh] overflow-hidden flex flex-col">
+            <div className="p-3 border-b border-slate-200 flex items-center justify-between bg-slate-50">
+              <div>
+                <h3 className="font-semibold text-slate-900 text-sm">{selectedItem.name}</h3>
+                <p className="text-xs text-slate-500">${Number(selectedItem.price).toFixed(2)}</p>
+              </div>
+              <button
+                onClick={() => { setSelectedItem(null); setItemOptions([]); setItemCustomizations({}) }}
+                className="p-1 hover:bg-slate-200 rounded"
+              >
+                <X className="w-4 h-4 text-slate-500" />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-3 space-y-4">
+              {loadingOptions ? (
+                <div className="text-center py-4">
+                  <div className="w-5 h-5 border-2 border-rose-200 border-t-rose-500 rounded-full animate-spin mx-auto" />
+                </div>
+              ) : itemOptions.length === 0 ? (
+                <p className="text-center text-slate-400 text-xs py-4">
+                  Este item no tiene opciones adicionales
+                </p>
+              ) : (
+                itemOptions.map((option) => {
+                  const isMulti = (option.max_selection || 1) > 1
+                  const isRequired = option.is_required
+
+                  return (
+                    <div key={option.id} className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <h4 className="text-xs font-semibold text-slate-700">
+                          {option.prompt || option.category}
+                        </h4>
+                        {isRequired && (
+                          <span className="text-[10px] bg-rose-100 text-rose-600 px-1.5 py-0.5 rounded font-medium">
+                            Requerido
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="space-y-1">
+                        {option.item_option_choices.map((choice) => {
+                          const isSelected = isMulti
+                            ? ((itemCustomizations[option.id] as string[]) || []).includes(choice.id)
+                            : itemCustomizations[option.id] === choice.id
+
+                          return (
+                            <label
+                              key={choice.id}
+                              className={`flex items-center justify-between p-2 rounded border cursor-pointer transition-colors ${
+                                isSelected
+                                  ? "bg-rose-50 border-rose-300"
+                                  : "bg-white border-slate-200 hover:border-slate-300"
+                              }`}
+                            >
+                              <div className="flex items-center gap-2">
+                                {isMulti ? (
+                                  <Checkbox
+                                    checked={isSelected}
+                                    onCheckedChange={() => handleOptionSelect(option.id, choice.id, true)}
+                                  />
+                                ) : (
+                                  <input
+                                    type="radio"
+                                    name={option.id}
+                                    checked={isSelected}
+                                    onChange={() => handleOptionSelect(option.id, choice.id, false)}
+                                    className="w-3.5 h-3.5 text-rose-500"
+                                  />
+                                )}
+                                <span className="text-xs text-slate-700">{choice.name}</span>
+                              </div>
+                              {choice.price_modifier && Number(choice.price_modifier) !== 0 && (
+                                <span className="text-xs text-slate-500">
+                                  +${Number(choice.price_modifier).toFixed(2)}
+                                </span>
+                              )}
+                            </label>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  )
+                })
+              )}
+              
+              {/* Special Instructions Section */}
+              <div className="pt-2 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => setShowItemNotes(!showItemNotes)}
+                  className="flex items-center gap-1 text-xs text-rose-500 hover:text-rose-600"
+                >
+                  <span className={`transform transition-transform ${showItemNotes ? "rotate-90" : ""}`}>
+                    <ChevronRight className="w-3 h-3" />
+                  </span>
+                  Instrucciones especiales
+                </button>
+                {showItemNotes && (
+                  <textarea
+                    value={itemNotes}
+                    onChange={(e) => setItemNotes(e.target.value)}
+                    placeholder="Informe al restaurante sobre alergias o instrucciones de preparacion."
+                    className="mt-2 w-full h-16 text-xs border border-slate-200 rounded-md p-2 resize-none focus:outline-none focus:ring-1 focus:ring-rose-500"
+                  />
+                )}
+              </div>
+            </div>
+
+            <div className="p-3 border-t border-slate-200 bg-slate-50">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs text-slate-600">Total</span>
+                <span className="text-sm font-bold text-slate-900">
+                  ${calculateItemPrice(selectedItem).toFixed(2)}
+                </span>
+              </div>
+              <Button
+                onClick={addItemToCart}
+                className="w-full h-9 bg-rose-500 hover:bg-rose-600 text-sm"
+              >
+                Agregar al Carrito ${calculateItemPrice(selectedItem).toFixed(2)}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
